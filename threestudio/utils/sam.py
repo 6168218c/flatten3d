@@ -12,14 +12,18 @@ from lang_sam import LangSAM
 
 
 class LangSAMTextSegmentor(torch.nn.Module):
-    def __init__(self, sam_type="vit_h"):
+    def __init__(self, sam_type="sam2.1_hiera_small"):
         super().__init__()
+        # self.model = None
         self.model = LangSAM(sam_type)
+        self.model.sam.model = self.model.sam.model.to("cpu")
+        torch.cuda.empty_cache()
 
         self.to_pil_image = ToPILImage(mode="RGB")
         self.to_tensor = ToTensor()
 
     def forward(self, images, prompt: str):
+        self.model.sam.model = self.model.sam.model.to("cuda")
         images = rearrange(images, "b h w c -> b c h w")
         masks = []
         for image in images:
@@ -33,6 +37,7 @@ class LangSAMTextSegmentor(torch.nn.Module):
                 print(f"None {prompt} Detected")
                 masks.append(torch.zeros_like(images[0, 0:1]))
 
+        self.model.sam.model = self.model.sam.model.to("cpu")
         return torch.stack(masks, dim=0)
 
 

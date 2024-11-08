@@ -59,6 +59,8 @@ class DGE(BaseLift3DSystem):
         cache_overwrite: bool = True
         cache_dir: str = ""
 
+        # offload
+        low_vram: bool = True
 
         # anchor
         anchor_weight_init: float = 0.1
@@ -192,7 +194,7 @@ class DGE(BaseLift3DSystem):
             else:
                 self.radii = torch.max(radii, self.radii)
 
-            depth = render_pkg["depth_3dgs"]
+            depth = render_pkg["depth_3dgs"].unsqueeze(0)
             depth = depth.permute(1, 2, 0)
 
             semantic_map = render(
@@ -260,7 +262,7 @@ class DGE(BaseLift3DSystem):
                     cv2.imwrite(cur_path, out_to_save)
                 cached_image = cv2.cvtColor(cv2.imread(cur_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
-                    cached_image / 255, device="cuda", dtype=torch.float32
+                    cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
                 )[None]
 
     def on_before_optimizer_step(self, optimizer):
@@ -569,10 +571,10 @@ class DGE(BaseLift3DSystem):
                 assert os.path.exists(original_image_path)
                 cached_image = cv2.cvtColor(cv2.imread(original_image_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
-                    cached_image / 255, device="cuda", dtype=torch.float32
+                    cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
                 )[None]
                 original_frames.append(self.origin_frames[id])
-            images = torch.cat(images, dim=0)
+            images = torch.cat(images, dim=0).to(device="cpu" if self.cfg.low_vram else "cuda")
             original_frames = torch.cat(original_frames, dim=0)
 
             edited_images = self.guidance(
@@ -611,7 +613,7 @@ class DGE(BaseLift3DSystem):
                 self.cfg.prompt_processor
             )
         if self.cfg.loss.lambda_l1 > 0 or self.cfg.loss.lambda_p > 0 or self.cfg.loss.use_sds:
-            self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
+            self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance, low_vram=self.cfg.low_vram)
             
 
     def training_step(self, batch, batch_idx):

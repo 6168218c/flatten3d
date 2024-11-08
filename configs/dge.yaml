@@ -2,7 +2,7 @@ name: "dge"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
- 
+
 data_type: "gs-load"
 data:
   batch_size: 1
@@ -13,7 +13,7 @@ data:
   light_sample_strategy: "dreamfusion3dgs"
   height: 512
   width: 512
-  use_original_resolution: False 
+  use_original_resolution: False
 
   elevation_view_num: 2
   azimuth_view_num: 8
@@ -31,8 +31,8 @@ system:
   min_opacity: 0.005
   prompt_processor_type: "stable-diffusion-prompt-processor"
   prompt_processor:
-    pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
-    prompt: 'a bicycle parked next to a bench in a park, all covered with snow, winter'
+    pretrained_model_name_or_path: "stable-diffusion-v1-5/stable-diffusion-v1-5"
+    prompt: "a bicycle parked next to a bench in a park, all covered with snow, winter"
   camera_update_per_step: 500
   added_noise_schedule: [999, 300, 300, 21]
 
@@ -52,11 +52,11 @@ system:
     guidance_scale: 7.5
     condition_scale: 1.5
     camera_batch_size: 5
-  
+
   loggers:
     wandb:
       enable: false
-      project: 'threestudio_dge'
+      project: "threestudio_dge"
       name: None
 
   loss:
@@ -84,5 +84,4 @@ checkpoint:
   save_last: true # save at each validation time
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
-
 # white_background: true

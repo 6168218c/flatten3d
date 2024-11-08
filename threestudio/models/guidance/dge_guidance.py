@@ -15,7 +15,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.dge_utils import register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, make_dge_block, isinstance_str, compute_epipolar_constrains, register_normal_attn_flag
+from threestudio.utils.dge_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, make_dge_block, isinstance_str, compute_epipolar_constrains, register_normal_attn_flag
 
 @threestudio.register("dge-guidance")
 class DGEGuidance(BaseObject):
@@ -25,6 +25,7 @@ class DGEGuidance(BaseObject):
         ddim_scheduler_name_or_path: str = "CompVis/stable-diffusion-v1-4"
         ip2p_name_or_path: str = "timbrooks/instruct-pix2pix"
 
+        low_vram: bool = False
         enable_memory_efficient_attention: bool = False
         enable_sequential_cpu_offload: bool = False
         enable_attention_slicing: bool = False
@@ -45,7 +46,7 @@ class DGEGuidance(BaseObject):
 
     cfg: Config
 
-    def configure(self) -> None:
+    def configure(self, *args, **kwargs) -> None:
         threestudio.info(f"Loading InstructPix2Pix ...")
 
         self.weights_dtype = (
@@ -70,6 +71,9 @@ class DGEGuidance(BaseObject):
             cache_dir=self.cfg.cache_dir,
         )
         self.scheduler.set_timesteps(self.cfg.diffusion_steps)
+        
+        if "low_vram" in kwargs: # overwrite with DGE system
+            self.cfg.low_vram = kwargs["low_vram"]
 
         if self.cfg.enable_memory_efficient_attention:
             if parse_version(torch.__version__) >= parse_version("2"):
@@ -83,7 +87,7 @@ class DGEGuidance(BaseObject):
             else:
                 self.pipe.enable_xformers_memory_efficient_attention()
 
-        if self.cfg.enable_sequential_cpu_offload:
+        if self.cfg.low_vram or self.cfg.enable_sequential_cpu_offload:
             self.pipe.enable_sequential_cpu_offload()
 
         if self.cfg.enable_attention_slicing:
@@ -169,7 +173,14 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 3 H W"]:
         input_dtype = latents.dtype
         latents = 1 / self.vae.config.scaling_factor * latents
-        image = self.vae.decode(latents.to(self.weights_dtype)).sample
+        if self.cfg.low_vram:
+            image = []
+            for latent in latents:
+                img = self.vae.decode(latent.unsqueeze(0).to(self.weights_dtype)).sample
+                image.append(img.squeeze())
+            image = torch.stack(image)
+        else:
+            image = self.vae.decode(latents.to(self.weights_dtype)).sample
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
 
@@ -204,8 +215,9 @@ class DGEGuidance(BaseObject):
             # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
             positive_text_embedding, negative_text_embedding, _ = text_embeddings.chunk(3)
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
-            for t in self.scheduler.timesteps:
+            for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
                 if t < 100:
+                    unregister_pivotal_data(self.unet)
                     self.use_normal_unet()
                 else:
                     register_normal_attn_flag(self.unet, False)
@@ -253,6 +265,8 @@ class DGEGuidance(BaseObject):
                         noise_pred_text.append(batch_noise_pred_text)
                         noise_pred_image.append(batch_noise_pred_image)
                         noise_pred_uncond.append(batch_noise_pred_uncond)
+                        
+                        torch.cuda.empty_cache()
 
                     noise_pred_text = torch.cat(noise_pred_text, dim=0)
                     noise_pred_image = torch.cat(noise_pred_image, dim=0)
@@ -369,25 +383,31 @@ class DGEGuidance(BaseObject):
 
         width = int((W * factor) // 64) * 64
         height = int((H * factor) // 64) * 64
-        rgb_BCHW = rgb.permute(0, 3, 1, 2)
+        rgb_BCHW = rgb.permute(0, 3, 1, 2).cuda()
 
         RH, RW = height, width
 
         rgb_BCHW_HW8 = F.interpolate(
             rgb_BCHW, (RH, RW), mode="bilinear", align_corners=False
         )
-        latents = self.encode_images(rgb_BCHW_HW8)
+        latents = self.encode_images(rgb_BCHW_HW8).to(torch.float16)
+        del rgb_BCHW
+        del rgb_BCHW_HW8
         
-        cond_rgb_BCHW = cond_rgb.permute(0, 3, 1, 2)
+        cond_rgb_BCHW = cond_rgb.permute(0, 3, 1, 2).cuda()
         cond_rgb_BCHW_HW8 = F.interpolate(
             cond_rgb_BCHW,
             (RH, RW),
             mode="bilinear",
             align_corners=False,
         )
-        cond_latents = self.encode_cond_images(cond_rgb_BCHW_HW8)
+        cond_latents = self.encode_cond_images(cond_rgb_BCHW_HW8).to(torch.float16)
+        del cond_rgb_BCHW
+        del cond_rgb_BCHW_HW8
+        
+        torch.cuda.empty_cache()
 
-        temp = torch.zeros(batch_size).to(rgb.device)
+        temp = torch.zeros(batch_size).to(latents.dtype)
         text_embeddings = prompt_utils.get_text_embeddings(temp, temp, temp, False)
         positive_text_embeddings, negative_text_embeddings = text_embeddings.chunk(2)
         text_embeddings = torch.cat(
