@@ -223,6 +223,10 @@ def register_t(diffusion_model, t):
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "t", t)
 
+def register_extra_fusing(diffusion_model, fusing_ratio):
+    for _, module in diffusion_model.named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.extra_fusing_ratio = fusing_ratio
 
 def register_normal_attention(model):
     # def sa_forward(self):
@@ -478,7 +482,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
             if self.use_normal_attn:
                 # print("use normal attn")
-                self.attn_output = self.attn1(
+                attn_output = self.attn1(
                         norm_hidden_states.view(batch_size, sequence_length, dim),
                         encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                         use_normal_attn=self.use_normal_attn,
@@ -488,36 +492,35 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 # print("use extend attn")
                 if self.pivotal_pass:
                     # norm_hidden_states.shape = 3, n_frames * seq_len, dim
-                    self.attn_output = self.attn1(
+                    attn_output = self.attn1(
                             norm_hidden_states.view(batch_size, sequence_length, dim),
                             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                             use_normal_attn=self.use_normal_attn,
                             **cross_attention_kwargs,
                         )
                     # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
-                    self.kf_attn_output = self.attn_output
+                    self.kf_attn_output = attn_output
 
                 else:
                     batch_kf_size, _, _ = self.kf_attn_output.shape
-                    self.attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
+                    attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
                                     closest_cam]
-
-            if self.use_ada_layer_norm_zero:
-                self.n = gate_msa.unsqueeze(1) * self.attn_output
+                    pivot_kv = self.pivot_hidden_states[:, closest_cam]
 
             # gather values from attn_output, using idx as indices, and get a tensor of shape 3, n_frames, seq_len, dim
             if not self.use_normal_attn:
                 if not self.pivotal_pass:
                     if len(batch_idxs) == 2:
-                        attn_1, attn_2 = self.attn_output[:, :, 0], self.attn_output[:, :, 1]
+                        attn_1, attn_2 = attn_output[:, :, 0], attn_output[:, :, 1]
                         idx1 = idx1.view(3, n_frames, sequence_length)
                         idx2 = idx2.view(3, n_frames, sequence_length)
                         attn_output1 = attn_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output2 = attn_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
                         d1 = cam_distance_min[0][:,0]
                         d2 = cam_distance_min[0][:,1]
-                        w1 = d2 / (d1 + d2)
-                        w1 = torch.sigmoid(w1)
+                        # w1 = d2 / (d1 + d2)
+                        # w1 = torch.sigmoid(w1)
+                        w1 = torch.nn.functional.softmax(torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)]),dim=0)[0]
                         w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
                         attn_output1 = attn_output1.view(3, n_frames, sequence_length, dim)
                         attn_output2 = attn_output2.view(3, n_frames, sequence_length, dim)
@@ -526,13 +529,49 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             batch_size, sequence_length, dim).half()
                     else:
                         idx1 = idx1.view(3, n_frames, sequence_length)
-                        attn_output = self.attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        attn_output = attn_output.reshape(batch_size, sequence_length, dim).half()                       
-                else:
-                    attn_output = self.attn_output
-            else:
-                attn_output = self.attn_output
-            
+                        attn_output = attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                        attn_output = attn_output.reshape(batch_size, sequence_length, dim).half() 
+                        
+                           
+                    if self.extra_fusing_ratio > 0: 
+                        if len(batch_idxs) == 2:
+                            kv_1, kv_2 = pivot_kv[:, :, 0], pivot_kv[:, :, 1]
+                            idx1 = idx1.view(3, n_frames, sequence_length)
+                            idx2 = idx2.view(3, n_frames, sequence_length)
+                            pivot_kv_1 = kv_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            pivot_kv_2 = kv_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            d1 = cam_distance_min[0][:,0]
+                            d2 = cam_distance_min[0][:,1]
+                            w1 = torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)])
+                            # w1 = torch.sigmoid(w1)
+                            w1 = torch.nn.functional.softmax(w1, dim=0)[0]
+                            w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
+                            pivot_kv_1 = pivot_kv_1.view(3, n_frames, sequence_length, dim)
+                            pivot_kv_2 = pivot_kv_2.view(3, n_frames, sequence_length, dim)
+                            pivot_kv = w1 * pivot_kv_1 + (1 - w1) * pivot_kv_2
+                            pivot_kv = pivot_kv.half()
+                        else:
+                            idx1 = idx1.view(3, n_frames, sequence_length)
+                            pivot_kv = pivot_kv[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            pivot_kv = pivot_kv.half()
+                            
+                        # cross attention towards key frames
+                        extra_fusing_output = []
+                        for i in range(norm_hidden_states.shape[1]):
+                            extra_fusing_output.append(
+                                self.attn1(
+                                    norm_hidden_states[:, i],
+                                    pivot_kv[:, i],
+                                    use_normal_attn=True,
+                                    **cross_attention_kwargs
+                                )
+                            )
+                            
+                        extra_fusing_output = torch.stack(extra_fusing_output, dim=1).reshape(batch_size, sequence_length, dim).half()   
+                        attn_output = self.extra_fusing_ratio * extra_fusing_output + (1 - self.extra_fusing_ratio) * attn_output
+                        
+            if self.use_ada_layer_norm_zero:
+                self.n = gate_msa.unsqueeze(1) * attn_output               
             
             hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 3 * n_frames, seq_len, dim
             hidden_states = attn_output + hidden_states

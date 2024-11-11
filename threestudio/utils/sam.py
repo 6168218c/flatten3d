@@ -16,6 +16,7 @@ class LangSAMTextSegmentor(torch.nn.Module):
         super().__init__()
         # self.model = None
         self.model = LangSAM(sam_type)
+        self.model.gdino.model = self.model.gdino.model.to("cpu")
         self.model.sam.model = self.model.sam.model.to("cpu")
         torch.cuda.empty_cache()
 
@@ -23,6 +24,7 @@ class LangSAMTextSegmentor(torch.nn.Module):
         self.to_tensor = ToTensor()
 
     def forward(self, images, prompt: str):
+        self.model.gdino.model = self.model.gdino.model.to("cuda")
         self.model.sam.model = self.model.sam.model.to("cuda")
         images = rearrange(images, "b h w c -> b c h w")
         masks = []
@@ -37,6 +39,7 @@ class LangSAMTextSegmentor(torch.nn.Module):
                 print(f"None {prompt} Detected")
                 masks.append(torch.zeros_like(images[0, 0:1]))
 
+        self.model.gdino.model = self.model.gdino.model.to("cpu")
         self.model.sam.model = self.model.sam.model.to("cpu")
         return torch.stack(masks, dim=0)
 
