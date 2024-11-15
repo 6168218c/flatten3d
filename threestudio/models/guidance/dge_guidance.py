@@ -15,7 +15,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.dge_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, register_extra_fusing, make_dge_block, isinstance_str, compute_epipolar_constrains, register_normal_attn_flag
+from threestudio.utils.dge_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, register_extra_fusing, register_low_vram, make_dge_block, isinstance_str, compute_epipolar_constrains, register_normal_attn_flag
 
 @threestudio.register("dge-guidance")
 class DGEGuidance(BaseObject):
@@ -217,6 +217,7 @@ class DGEGuidance(BaseObject):
             positive_text_embedding, negative_text_embedding, _ = text_embeddings.chunk(3)
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
             for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
+                register_low_vram(self.unet, self.cfg.low_vram)
                 if t < 100:
                     unregister_pivotal_data(self.unet)
                     self.use_normal_unet()
@@ -268,7 +269,8 @@ class DGEGuidance(BaseObject):
                         noise_pred_image.append(batch_noise_pred_image)
                         noise_pred_uncond.append(batch_noise_pred_uncond)
                         
-                        torch.cuda.empty_cache()
+                        if self.cfg.low_vram:
+                            torch.cuda.empty_cache()
 
                     noise_pred_text = torch.cat(noise_pred_text, dim=0)
                     noise_pred_image = torch.cat(noise_pred_image, dim=0)
@@ -407,7 +409,8 @@ class DGEGuidance(BaseObject):
         del cond_rgb_BCHW
         del cond_rgb_BCHW_HW8
         
-        torch.cuda.empty_cache()
+        if self.cfg.low_vram:
+            torch.cuda.empty_cache()
 
         temp = torch.zeros(batch_size).to(latents.dtype)
         text_embeddings = prompt_utils.get_text_embeddings(temp, temp, temp, False)

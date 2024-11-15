@@ -227,6 +227,11 @@ def register_extra_fusing(diffusion_model, fusing_ratio):
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
             module.extra_fusing_ratio = fusing_ratio
+            
+def register_low_vram(diffusion_model, low_vram):
+    for _, module in diffusion_model.named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.low_vram = low_vram
 
 def register_normal_attention(model):
     # def sa_forward(self):
@@ -556,18 +561,26 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             pivot_kv = pivot_kv.half()
                             
                         # cross attention towards key frames
-                        extra_fusing_output = []
-                        for i in range(norm_hidden_states.shape[1]):
-                            extra_fusing_output.append(
-                                self.attn1(
-                                    norm_hidden_states[:, i],
-                                    pivot_kv[:, i],
-                                    use_normal_attn=True,
-                                    **cross_attention_kwargs
+                        if self.low_vram:
+                            extra_fusing_output = []
+                            for i in range(norm_hidden_states.shape[1]):
+                                extra_fusing_output.append(
+                                    self.attn1(
+                                        norm_hidden_states[:, i],
+                                        torch.cat([norm_hidden_states[:,i], pivot_kv[:, i]], dim=-2), # TODO maybe concat with original KV for better performance?
+                                        use_normal_attn=True,
+                                        **cross_attention_kwargs
+                                    )
                                 )
-                            )
-                            
-                        extra_fusing_output = torch.stack(extra_fusing_output, dim=1).reshape(batch_size, sequence_length, dim).half()   
+                            extra_fusing_output = torch.stack(extra_fusing_output, dim=1).reshape(batch_size, sequence_length, dim).half()  
+                        else:
+                            extra_fusing_output = self.attn1(
+                                norm_hidden_states.view(batch_size, sequence_length, dim),
+                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, sequence_length, dim), # TODO maybe concat with original KV for better performance?
+                                use_normal_attn=True,
+                                **cross_attention_kwargs
+                            ).half() 
+                        
                         attn_output = self.extra_fusing_ratio * extra_fusing_output + (1 - self.extra_fusing_ratio) * attn_output
                         
             if self.use_ada_layer_norm_zero:
