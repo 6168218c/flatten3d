@@ -202,6 +202,13 @@ def register_pivotal(diffusion_model, is_pivotal):
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "pivotal_pass", is_pivotal)
             
+def unregister_pivotal_data(diffusion_model):
+    for _, module in diffusion_model.named_modules():
+        # If for some reason this has a different name, create an issue and I'll fix it
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.cleanup_cache()
+    torch.cuda.empty_cache()
+            
 def register_batch_idx(diffusion_model, batch_idx):
     for _, module in diffusion_model.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
@@ -216,42 +223,46 @@ def register_t(diffusion_model, t):
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "t", t)
 
+def register_extra_fusing(diffusion_model, fusing_ratio):
+    for _, module in diffusion_model.named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.extra_fusing_ratio = fusing_ratio
 
 def register_normal_attention(model):
-    def sa_forward(self):
-        to_out = self.to_out
-        if type(to_out) is torch.nn.modules.container.ModuleList:
-            to_out = self.to_out[0]
-        else:
-            to_out = self.to_out
-        def forward(x, encoder_hidden_states=None, attention_mask=None):
-            # assert encoder_hidden_states is None 
-            batch_size, sequence_length, dim = x.shape
-            h = self.heads
-            is_cross = encoder_hidden_states is not None
-            encoder_hidden_states = encoder_hidden_states if is_cross else x
-            q = self.to_q(x)
-            k = self.to_k(encoder_hidden_states)
-            v = self.to_v(encoder_hidden_states)
+    # def sa_forward(self):
+    #     to_out = self.to_out
+    #     if type(to_out) is torch.nn.modules.container.ModuleList:
+    #         to_out = self.to_out[0]
+    #     else:
+    #         to_out = self.to_out
+    #     def forward(x, encoder_hidden_states=None, attention_mask=None):
+    #         # assert encoder_hidden_states is None 
+    #         batch_size, sequence_length, dim = x.shape
+    #         h = self.heads
+    #         is_cross = encoder_hidden_states is not None
+    #         encoder_hidden_states = encoder_hidden_states if is_cross else x
+    #         q = self.to_q(x)
+    #         k = self.to_k(encoder_hidden_states)
+    #         v = self.to_v(encoder_hidden_states)
 
-            if self.group_norm is not None:
-                hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+    #         if self.group_norm is not None:
+    #             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-            query = self.head_to_batch_dim(q)
-            key = self.head_to_batch_dim(k)
-            value = self.head_to_batch_dim(v)
+    #         query = self.head_to_batch_dim(q)
+    #         key = self.head_to_batch_dim(k)
+    #         value = self.head_to_batch_dim(v)
 
-            attention_probs = self.get_attention_scores(query, key)
-            hidden_states = torch.bmm(attention_probs, value)
-            out = self.batch_to_head_dim(hidden_states)
+    #         attention_probs = self.get_attention_scores(query, key)
+    #         hidden_states = torch.bmm(attention_probs, value)
+    #         out = self.batch_to_head_dim(hidden_states)
 
-            return to_out(out)
+    #         return to_out(out)
 
-        return forward
+    #     return forward
 
     for _, module in model.unet.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
-            module.attn1.normal_attn = sa_forward(module.attn1)
+            # module.attn1.normal_attn = sa_forward(module.attn1)
             module.use_normal_attn = True
 
 def register_normal_attn_flag(diffusion_model, use_normal_attn):
@@ -266,7 +277,7 @@ def register_extended_attention(model):
             to_out = self.to_out[0]
         else:
             to_out = self.to_out
-        def forward(x, encoder_hidden_states=None, attention_mask=None):
+        def extended_forward(x, encoder_hidden_states=None, attention_mask=None):
             assert encoder_hidden_states is None 
             batch_size, sequence_length, dim = x.shape
             h = self.heads
@@ -331,11 +342,18 @@ def register_extended_attention(model):
             out = self.batch_to_head_dim(out)
 
             return to_out(out)
+        
+        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False):
+            if use_normal_attn:
+                return self.orig_forward(x, encoder_hidden_states, attention_mask)
+            else:
+                return extended_forward(x, encoder_hidden_states, attention_mask)
 
         return forward
 
     for _, module in model.unet.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
+            setattr(module.attn1,"orig_forward", module.attn1.forward)
             module.attn1.forward = sa_forward(module.attn1)
 
 
@@ -464,44 +482,45 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
             if self.use_normal_attn:
                 # print("use normal attn")
-                self.attn_output = self.attn1.normal_attn(
+                attn_output = self.attn1(
                         norm_hidden_states.view(batch_size, sequence_length, dim),
                         encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                        use_normal_attn=self.use_normal_attn,
                         **cross_attention_kwargs,
                     )         
             else:
                 # print("use extend attn")
                 if self.pivotal_pass:
                     # norm_hidden_states.shape = 3, n_frames * seq_len, dim
-                    self.attn_output = self.attn1(
+                    attn_output = self.attn1(
                             norm_hidden_states.view(batch_size, sequence_length, dim),
                             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                            use_normal_attn=self.use_normal_attn,
                             **cross_attention_kwargs,
                         )
                     # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
-                    self.kf_attn_output = self.attn_output
+                    self.kf_attn_output = attn_output
 
                 else:
                     batch_kf_size, _, _ = self.kf_attn_output.shape
-                    self.attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
+                    attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
                                     closest_cam]
-
-            if self.use_ada_layer_norm_zero:
-                self.n = gate_msa.unsqueeze(1) * self.attn_output
+                    pivot_kv = self.pivot_hidden_states[:, closest_cam]
 
             # gather values from attn_output, using idx as indices, and get a tensor of shape 3, n_frames, seq_len, dim
             if not self.use_normal_attn:
                 if not self.pivotal_pass:
                     if len(batch_idxs) == 2:
-                        attn_1, attn_2 = self.attn_output[:, :, 0], self.attn_output[:, :, 1]
+                        attn_1, attn_2 = attn_output[:, :, 0], attn_output[:, :, 1]
                         idx1 = idx1.view(3, n_frames, sequence_length)
                         idx2 = idx2.view(3, n_frames, sequence_length)
                         attn_output1 = attn_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output2 = attn_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
                         d1 = cam_distance_min[0][:,0]
                         d2 = cam_distance_min[0][:,1]
-                        w1 = d2 / (d1 + d2)
-                        w1 = torch.sigmoid(w1)
+                        # w1 = d2 / (d1 + d2)
+                        # w1 = torch.sigmoid(w1)
+                        w1 = torch.nn.functional.softmax(torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)]),dim=0)[0]
                         w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
                         attn_output1 = attn_output1.view(3, n_frames, sequence_length, dim)
                         attn_output2 = attn_output2.view(3, n_frames, sequence_length, dim)
@@ -510,13 +529,43 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             batch_size, sequence_length, dim).half()
                     else:
                         idx1 = idx1.view(3, n_frames, sequence_length)
-                        attn_output = self.attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        attn_output = attn_output.reshape(batch_size, sequence_length, dim).half()                       
-                else:
-                    attn_output = self.attn_output
-            else:
-                attn_output = self.attn_output
-            
+                        attn_output = attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                        attn_output = attn_output.reshape(batch_size, sequence_length, dim).half() 
+                           
+                    if self.extra_fusing_ratio > 0: 
+                        if len(batch_idxs) == 2:
+                            kv_1, kv_2 = pivot_kv[:, :, 0], pivot_kv[:, :, 1]
+                            idx1 = idx1.view(3, n_frames, sequence_length)
+                            idx2 = idx2.view(3, n_frames, sequence_length)
+                            pivot_kv_1 = kv_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            pivot_kv_2 = kv_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            d1 = cam_distance_min[0][:,0]
+                            d2 = cam_distance_min[0][:,1]
+                            w1 = torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)])
+                            # w1 = torch.sigmoid(w1)
+                            w1 = torch.nn.functional.softmax(w1, dim=0)[0]
+                            w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
+                            pivot_kv_1 = pivot_kv_1.view(3, n_frames, sequence_length, dim)
+                            pivot_kv_2 = pivot_kv_2.view(3, n_frames, sequence_length, dim)
+                            pivot_kv = w1 * pivot_kv_1 + (1 - w1) * pivot_kv_2
+                            pivot_kv = pivot_kv.half()
+                        else:
+                            idx1 = idx1.view(3, n_frames, sequence_length)
+                            pivot_kv = pivot_kv[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
+                            pivot_kv = pivot_kv.half()
+                            
+                        # cross attention towards key frames
+                        extra_fusing_output = self.attn1(
+                            norm_hidden_states.view(batch_size, sequence_length, dim),
+                            torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, sequence_length * 2, dim), # TODO maybe concat with original KV for better performance?
+                            use_normal_attn=True,
+                            **cross_attention_kwargs
+                        ).half() 
+                        
+                        attn_output = self.extra_fusing_ratio * extra_fusing_output + (1 - self.extra_fusing_ratio) * attn_output
+                        
+            if self.use_ada_layer_norm_zero:
+                self.n = gate_msa.unsqueeze(1) * attn_output               
             
             hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 3 * n_frames, seq_len, dim
             hidden_states = attn_output + hidden_states
@@ -550,6 +599,12 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             hidden_states = ff_output + hidden_states
 
             return hidden_states
+        
+        def cleanup_cache(self):
+            if hasattr(self, "pivot_hidden_states"):
+                del self.pivot_hidden_states
+            if hasattr(self, "kf_attn_output"):
+                del self.kf_attn_output
 
     return DGEBlock
 
