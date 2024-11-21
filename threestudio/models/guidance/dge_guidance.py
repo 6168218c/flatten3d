@@ -218,12 +218,12 @@ class DGEGuidance(BaseObject):
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
             for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
                 register_low_vram(self.unet, self.cfg.low_vram)
+                register_extra_fusing(self.unet, self.cfg.extra_fusing_ratio)
                 if t < 100:
                     unregister_pivotal_data(self.unet)
                     self.use_normal_unet()
                 else:
                     register_normal_attn_flag(self.unet, False)
-                    register_extra_fusing(self.unet, self.cfg.extra_fusing_ratio)
                 with torch.no_grad():
                     # pred noise
                     noise_pred_text = []

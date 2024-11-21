@@ -576,7 +576,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         else:
                             extra_fusing_output = self.attn1(
                                 norm_hidden_states.view(batch_size, sequence_length, dim),
-                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, sequence_length, dim), # TODO maybe concat with original KV for better performance?
+                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, sequence_length * 2, dim), # TODO maybe concat with original KV for better performance?
                                 use_normal_attn=True,
                                 **cross_attention_kwargs
                             ).half() 

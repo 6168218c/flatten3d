@@ -60,7 +60,8 @@ class DGE(BaseLift3DSystem):
         cache_dir: str = ""
 
         # offload
-        low_vram: bool = True
+        low_vram: bool = field(default_factory=
+                               lambda: torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 ** 3) < 12)
 
         # anchor
         anchor_weight_init: float = 0.1
