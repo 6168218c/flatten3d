@@ -195,7 +195,7 @@ class DGE(BaseLift3DSystem):
             else:
                 self.radii = torch.max(radii, self.radii)
 
-            depth = render_pkg["depth_3dgs"].unsqueeze(0)
+            depth = render_pkg["depth_3dgs"]
             depth = depth.permute(1, 2, 0)
 
             semantic_map = render(

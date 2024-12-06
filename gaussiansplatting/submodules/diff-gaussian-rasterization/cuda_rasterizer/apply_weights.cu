@@ -232,7 +232,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y) renderCUDA_apply_weights(
     const float4 *__restrict__ conic_opacity, float *__restrict__ final_T,
     uint32_t *__restrict__ n_contrib, const float *__restrict__ bg_color,
     const float *__restrict__ image_weights, float *__restrict__ out_weights,
-    int *__restrict__ out_cnt, const bool render_like, const int num_channels) {
+    int *__restrict__ out_cnt, const int render_mode, const int num_channels) {
   // Identify current tile and associated min/max pixel range.
   auto block = cg::this_thread_block();
   uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -318,12 +318,15 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y) renderCUDA_apply_weights(
 
       // Eq. (3) from 3D Gaussian splatting paper.
       for (int ch = 0; ch < num_channels; ch++) {
-        if (render_like)
-          atomicAdd(&out_weights[collected_id[j] * num_channels + ch],
-                    image_weights[ch * H * W + pix_id] * alpha * T);
-        else
+        if (render_mode == 0)
           atomicAdd(&out_weights[collected_id[j] * num_channels + ch],
                     image_weights[ch * H * W + pix_id]);
+        else if (render_mode == 1)
+          atomicAdd(&out_weights[collected_id[j] * num_channels + ch],
+                    image_weights[ch * H * W + pix_id] * alpha);
+        else
+          atomicAdd(&out_weights[collected_id[j] * num_channels + ch],
+                    image_weights[ch * H * W + pix_id] * alpha * T);
         // atomicAdd(out_weights + (collected_id[j] * CHANNELS + ch), C[ch] *
         // T);
         atomicAdd(&out_cnt[collected_id[j] * num_channels + ch], 1);
@@ -356,10 +359,15 @@ void APPLY_WEIGHTS::render(const dim3 grid, dim3 block, const uint2 *ranges,
                            float *final_T, uint32_t *n_contrib,
                            const float *bg_color, const float *image_weights,
                            float *out_weights, int *out_cnt,
-                           const bool render_like, const int num_channels) {
+                           const int render_mode, const int num_channels) {
+  if (render_mode < 0 || render_mode > 2)
+  {
+    printf("ERROR: Unsupported render mode %d in apply_weights()", render_mode);
+    exit(-1);
+  }
   renderCUDA_apply_weights<<<grid, block>>>(
       ranges, point_list, W, H, means2D, conic_opacity, final_T, n_contrib,
-      bg_color, image_weights, out_weights, out_cnt, render_like, num_channels);
+      bg_color, image_weights, out_weights, out_cnt, render_mode, num_channels);
 }
 
 void APPLY_WEIGHTS::preprocess(

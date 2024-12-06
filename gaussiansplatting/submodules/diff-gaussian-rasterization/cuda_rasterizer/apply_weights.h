@@ -27,7 +27,7 @@ void render(const dim3 grid, dim3 block, const uint2 *ranges,
             const float2 *points_xy_image, const float4 *conic_opacity,
             float *final_T, uint32_t *n_contrib, const float *bg_color,
             const float *image_weights, float *out_weights, int *out_cnt,
-            const bool render_like, const int num_channels);
+            const int render_mode, const int num_channels);
 } // namespace APPLY_WEIGHTS
 
 #endif

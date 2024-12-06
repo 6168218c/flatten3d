@@ -823,10 +823,10 @@ class GaussianModel:
             None,
             self.get_opacity,
             None,
-            weights,
             self.get_scaling,
             self.get_rotation,
             None,
+            weights,
             weights_cnt,
             image_weights,
         )
@@ -921,3 +921,30 @@ class GaussianModel:
         self._generation = torch.cat([self._generation, torch.zeros_like(new_opacities[:, 0], dtype=torch.int64)],
                                      dim=0)
         self.update_anchor()
+        
+    # def get_latent_map_correspondence(self, keycam, camera, latent_width, latent_height):
+    #     sequence_len = latent_width * latent_height
+    #     weights = torch.zeros((len(self._opacity), sequence_len), dtype=torch.float32, device=self._opacity.device)
+    #     weights_cnt = torch.zeros((len(self._opacity), sequence_len), dtype=torch.int32, device=self._opacity.device)
+    #     image_weights = torch.diag(
+    #         torch.ones((sequence_len,), dtype=torch.float32, device=self._opacity.device)
+    #     ).view(-1, latent_width, latent_height)
+    #     rasterizer_key = camera2rasterizer(
+    #         keycam, torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda"),
+    #         override_width=latent_width, override_height=latent_height
+    #     )
+        
+    #     rasterizer_key.apply_weights(
+    #         self.get_xyz,
+    #         None,
+    #         self.get_opacity,
+    #         None,
+    #         self.get_scaling,
+    #         self.get_rotation,
+    #         None,
+    #         weights,
+    #         weights_cnt,
+    #         image_weights,
+    #     )
+        
+        

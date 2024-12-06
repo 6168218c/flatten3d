@@ -18,13 +18,13 @@ from diff_gaussian_rasterization import (
 from gaussiansplatting.utils.sh_utils import eval_sh
 
 
-def camera2rasterizer(viewpoint_camera, bg_color: torch.Tensor, sh_degree: int = 0):
+def camera2rasterizer(viewpoint_camera, bg_color: torch.Tensor, sh_degree: int = 0, override_width=None, override_height=None):
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=int(viewpoint_camera.image_height) if override_height is None else override_height,
+        image_width=int(viewpoint_camera.image_width) if override_width is None else override_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -49,6 +49,8 @@ def render(
     bg_color: torch.Tensor,
     scaling_modifier=1.0,
     override_color=None,
+    override_width=None,
+    override_height=None,
 ):
     """
     Render the scene.
@@ -73,8 +75,8 @@ def render(
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=int(viewpoint_camera.image_height) if override_height is None else override_height,
+        image_width=int(viewpoint_camera.image_width) if override_width is None else override_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -146,7 +148,7 @@ def render(
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
         "radii": radii,
-        "depth_3dgs": depth,
+        "depth_3dgs": depth.unsqueeze(0),
     }
 
 
@@ -246,5 +248,5 @@ def point_cloud_render(
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
         "radii": radii,
-        "depth_3dgs": depth,
+        "depth_3dgs": depth.unsqueeze(0),
     }

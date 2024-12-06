@@ -107,7 +107,7 @@ namespace CudaRasterizer
 			const float *image_weights,
 			float *out_weights,
 			int *out_cnt,
-			const bool render_like = false,
+			const int render_mode = 0,
 			const int num_channels = 3,
 			int *radii = nullptr,
 			bool debug = false);

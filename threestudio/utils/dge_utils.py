@@ -282,16 +282,21 @@ def register_extended_attention(model):
             to_out = self.to_out[0]
         else:
             to_out = self.to_out
-        def extended_forward(x, encoder_hidden_states=None, attention_mask=None):
+        def extended_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map_qkv=False, skip_map_out=False):
             assert encoder_hidden_states is None 
             batch_size, sequence_length, dim = x.shape
             h = self.heads
             n_frames = batch_size // 3
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
-            q = self.to_q(x)
-            k = self.to_k(encoder_hidden_states)
-            v = self.to_v(encoder_hidden_states)
+            if skip_map_qkv:
+                q = x
+                k = encoder_hidden_states
+                v = encoder_hidden_states
+            else:
+                q = self.to_q(x)
+                k = self.to_k(encoder_hidden_states)
+                v = self.to_v(encoder_hidden_states)
             
             k_text = k[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
             k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
@@ -346,13 +351,49 @@ def register_extended_attention(model):
             out = torch.cat([out_text, out_image, out_uncond], dim=0)
             out = self.batch_to_head_dim(out)
 
-            return to_out(out)
+            if not skip_map_out:
+                out = to_out(out)
+            
+            return out
         
-        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False):
-            if use_normal_attn:
-                return self.orig_forward(x, encoder_hidden_states, attention_mask)
+        def skippable_normal_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map_qkv=False, skip_map_out=False):
+            # assert encoder_hidden_states is None 
+            batch_size, sequence_length, dim = x.shape
+            h = self.heads
+            is_cross = encoder_hidden_states is not None
+            encoder_hidden_states = encoder_hidden_states if is_cross else x
+            if skip_map_qkv:
+                q = x
+                k = encoder_hidden_states
+                v = encoder_hidden_states
             else:
-                return extended_forward(x, encoder_hidden_states, attention_mask)
+                q = self.to_q(x)
+                k = self.to_k(encoder_hidden_states)
+                v = self.to_v(encoder_hidden_states)
+
+            if self.group_norm is not None:
+                hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+            query = self.head_to_batch_dim(q)
+            key = self.head_to_batch_dim(k)
+            value = self.head_to_batch_dim(v)
+
+            # attention_probs = self.get_attention_scores(query, key)
+            # hidden_states = torch.bmm(attention_probs, value)
+            hidden_states = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=self.scale)
+            out = self.batch_to_head_dim(hidden_states)
+
+            if not skip_map_out:
+                out = to_out(out)
+            
+            return out
+        
+        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False, skip_map_qkv=False, skip_map_out=False):
+            if use_normal_attn:
+                if not skip_map_qkv and not skip_map_out: return self.orig_forward(x, encoder_hidden_states, attention_mask)
+                else: return skippable_normal_forward(x, encoder_hidden_states, attention_mask, skip_map_qkv, skip_map_out)
+            else:
+                return extended_forward(x, encoder_hidden_states, attention_mask, skip_map_qkv, skip_map_out)
 
         return forward
 
@@ -576,10 +617,21 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         else:
                             extra_fusing_output = self.attn1(
                                 norm_hidden_states.view(batch_size, sequence_length, dim),
-                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, sequence_length * 2, dim), # TODO maybe concat with original KV for better performance?
+                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, -1, dim), # TODO maybe concat with original KV for better performance?
                                 use_normal_attn=True,
                                 **cross_attention_kwargs
                             ).half() 
+                            # closest_attn_outputs = self.kf_attn_output.view(
+                            #         3, batch_kf_size // 3, sequence_length, dim
+                            #     )[:, closest_cam].view(3, n_frames, -1, dim)
+                            # extra_fusing_output = self.attn1(
+                            #     extra_fusing_output.view(batch_size * sequence_length, 1, dim),
+                            #     closest_attn_outputs.view(batch_size * sequence_length, -1, dim), # TODO maybe concat with original KV for better performance?
+                            #     use_normal_attn=True,
+                            #     skip_linear=True,
+                            #     **cross_attention_kwargs
+                            # ).half() 
+                            # extra_fusing_output = extra_fusing_output.view(batch_size, sequence_length, dim)
                         
                         attn_output = self.extra_fusing_ratio * extra_fusing_output + (1 - self.extra_fusing_ratio) * attn_output
                         

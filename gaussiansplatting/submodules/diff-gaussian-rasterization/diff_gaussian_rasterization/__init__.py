@@ -317,10 +317,14 @@ class GaussianRasterizer(nn.Module):
         scales=None,
         rotations=None,
         cov3Ds_precomp=None,
+        weights=None,
+        weights_cnt=None,
         image_weights=None,
-        render_like=False,
+        render_mode=0,
     ):
         assert image_weights is not None
+        assert weights is not None and weights_cnt is not None
+        assert weights.shape[1] == weights_cnt.shape[1] and weights.shape[1] == image_weights.shape[0]
 
         raster_settings = self.raster_settings
         means2D = torch.zeros_like(means3D)
@@ -336,8 +340,10 @@ class GaussianRasterizer(nn.Module):
 
         args = (
             raster_settings.bg,
+            weights,
+            weights_cnt,
             image_weights,
-            render_like,
+            render_mode,
             means3D,
             opacities,
             scales,
@@ -357,6 +363,4 @@ class GaussianRasterizer(nn.Module):
             raster_settings.debug,
         )
 
-        (weights, weights_cnt) = _C.apply_weights(*args)
-        
-        return weights, weights_cnt
+        _C.apply_weights(*args)

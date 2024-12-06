@@ -371,7 +371,7 @@ void CudaRasterizer::Rasterizer::apply_weights(
     const float *cov3D_precomp, const float *viewmatrix,
     const float *projmatrix, const float *cam_pos, const float tan_fovx,
     float tan_fovy, const bool prefiltered, const float *image_weights,
-    float *out_weights, int *out_cnt, const bool render_like, const int num_channels,
+    float *out_weights, int *out_cnt, const int render_mode, const int num_channels,
     int *radii, bool debug)
 {
   const float focal_y = height / (2.0f * tan_fovy);
@@ -464,7 +464,7 @@ void CudaRasterizer::Rasterizer::apply_weights(
                  width, height, geomState.means2D,
                  geomState.conic_opacity, imgState.accum_alpha,
                  imgState.n_contrib, background, image_weights,
-                 out_weights, out_cnt, render_like,
+                 out_weights, out_cnt, render_mode,
                  num_channels),
              debug);
 }

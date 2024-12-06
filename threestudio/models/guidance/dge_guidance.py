@@ -152,7 +152,15 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
+        if self.cfg.low_vram:
+            from diffusers.models.vae import DiagonalGaussianDistribution
+            posterior_parameters = []
+            for img in imgs:
+                posterior_parameters.append(self.vae.encode(img.unsqueeze(0).to(self.weights_dtype)).latent_dist.parameters)
+            posterior_parameters = torch.concat(posterior_parameters, dim=0)
+            posterior = DiagonalGaussianDistribution(posterior_parameters)
+        else:
+            posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
         return latents.to(input_dtype)
 
@@ -162,7 +170,15 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
+        if self.cfg.low_vram:
+            from diffusers.models.vae import DiagonalGaussianDistribution
+            posterior_parameters = []
+            for img in imgs:
+                posterior_parameters.append(self.vae.encode(img.unsqueeze(0).to(self.weights_dtype)).latent_dist.parameters)
+            posterior_parameters = torch.concat(posterior_parameters, dim=0)
+            posterior = DiagonalGaussianDistribution(posterior_parameters)
+        else:
+            posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
         latents = posterior.mode()
         uncond_image_latents = torch.zeros_like(latents)
         latents = torch.cat([latents, latents, uncond_image_latents], dim=0)
