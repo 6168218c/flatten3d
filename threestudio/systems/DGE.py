@@ -545,6 +545,7 @@ class DGE(BaseLift3DSystem):
         cameras = []
         images = []
         original_frames = []
+        depth_maps = []
         t_max_step = self.cfg.added_noise_schedule
         self.guidance.max_step = t_max_step[min(len(t_max_step)-1, self.true_global_step//self.cfg.camera_update_per_step)]
         with torch.no_grad():
@@ -566,9 +567,15 @@ class DGE(BaseLift3DSystem):
                 }
                 out_pkg = self(cur_batch)
                 out = out_pkg["comp_rgb"]
+                depth = out_pkg["depth"]
+                # depth_visual = depth[0]
+                # depth_visual = (depth_visual - depth_visual.min()) / (depth_visual.max() - depth_visual.min()) * 255.0
+                # depth_visual = depth_visual.detach().cpu().numpy().astype(np.uint8)
+                # cv2.imwrite(f"debug/depth_{id}.jpg", cv2.applyColorMap(depth_visual, cv2.COLORMAP_JET))
                 if self.cfg.use_masked_image:
                     out = out * out_pkg["masks"].unsqueeze(-1)
                 images.append(out)
+                depth_maps.append(depth)
                 assert os.path.exists(original_image_path)
                 cached_image = cv2.cvtColor(cv2.imread(original_image_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
@@ -576,11 +583,13 @@ class DGE(BaseLift3DSystem):
                 )[None]
                 original_frames.append(self.origin_frames[id])
             images = torch.cat(images, dim=0).to(device="cpu" if self.cfg.low_vram else "cuda")
+            depth_maps = torch.cat(depth_maps, dim=0).to(device="cpu" if self.cfg.low_vram else "cuda")
             original_frames = torch.cat(original_frames, dim=0)
 
             edited_images = self.guidance(
                 images,
                 original_frames,
+                depth_maps,
                 self.prompt_processor(),
                 cams = cams_sorted
             )

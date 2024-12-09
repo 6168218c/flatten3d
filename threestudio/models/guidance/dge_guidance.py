@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import torch
+import torch.amp
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, StableDiffusionInstructPix2PixPipeline
 from diffusers.utils.import_utils import is_xformers_available
@@ -15,7 +16,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.dge_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, register_extra_fusing, register_low_vram, make_dge_block, isinstance_str, compute_epipolar_constrains, register_normal_attn_flag
+from threestudio.utils.dge_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_epipolar_geometry, register_extended_attention, register_normal_attention, register_extended_attention, register_extra_fusing, register_depth_align_strength, register_low_vram, make_dge_block, isinstance_str, compute_epipolar_constrains, compute_epipolar_depth_error, register_normal_attn_flag
 
 @threestudio.register("dge-guidance")
 class DGEGuidance(BaseObject):
@@ -43,6 +44,7 @@ class DGEGuidance(BaseObject):
         diffusion_steps: int = 20
         use_sds: bool = False
         extra_fusing_ratio: float = 0.0
+        depth_align_strength: float = 0.1
         camera_batch_size: int = 5
 
     cfg: Config
@@ -211,6 +213,7 @@ class DGEGuidance(BaseObject):
         text_embeddings: Float[Tensor, "BB 77 768"],
         latents: Float[Tensor, "B 4 DH DW"],
         image_cond_latents: Float[Tensor, "B 4 DH DW"],
+        depth_latents: Float[Tensor, "B 1 DW DW"],
         t: Int[Tensor, "B"],
         cams= None,
     ) -> Float[Tensor, "B 4 DH DW"]:
@@ -235,6 +238,7 @@ class DGEGuidance(BaseObject):
             for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
                 register_low_vram(self.unet, self.cfg.low_vram)
                 register_extra_fusing(self.unet, self.cfg.extra_fusing_ratio)
+                register_depth_align_strength(self.unet, self.cfg.depth_align_strength)
                 if t < 100:
                     unregister_pivotal_data(self.unet)
                     self.use_normal_unet()
@@ -262,17 +266,29 @@ class DGEGuidance(BaseObject):
                         register_cams(self.unet, cams[b:b + camera_batch_size], pivotal_idx[i] % camera_batch_size, key_cams) 
                         
                         epipolar_constrains = {}
+                        epipolar_depth_error = {}
                         for down_sample_factor in [1, 2, 4, 8]:
                             H = current_H // down_sample_factor
                             W = current_W // down_sample_factor
                             epipolar_constrains[H * W] = []
-                            for cam in cams[b:b + camera_batch_size]:
+                            epipolar_depth_error[H * W] = []
+                            for cam_index, cam in enumerate(cams[b:b + camera_batch_size], b):
                                 cam_epipolar_constrains = []
-                                for key_cam in key_cams:
+                                cam_epipolar_depth_error = []
+                                for pivot_array_index, key_cam in enumerate(key_cams):
                                     cam_epipolar_constrains.append(compute_epipolar_constrains(key_cam, cam, current_H=H, current_W=W))
+                                    cam_epipolar_depth_error.append(
+                                        compute_epipolar_depth_error(key_cam, cam, 
+                                            depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
+                                            depth2=depth_latents[cam_index].unsqueeze(0),
+                                            current_H=H, current_W=W
+                                        )
+                                    )
                                 epipolar_constrains[H * W].append(torch.stack(cam_epipolar_constrains, dim=0))
+                                epipolar_depth_error[H * W].append(torch.stack(cam_epipolar_depth_error, dim=0))
                             epipolar_constrains[H * W] = torch.stack(epipolar_constrains[H * W], dim=0)
-                        register_epipolar_constrains(self.unet, epipolar_constrains)
+                            epipolar_depth_error[H * W] = torch.stack(epipolar_depth_error[H * W], dim=0)
+                        register_epipolar_geometry(self.unet, epipolar_constrains, epipolar_depth_error)
 
                         batch_model_input = torch.cat([latents[b:b + camera_batch_size]] * 3)
                         batch_text_embeddings = torch.cat([positive_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size]], dim=0)
@@ -302,6 +318,25 @@ class DGEGuidance(BaseObject):
                     # get previous sample, continue loop
                     latents = self.scheduler.step(noise_pred, t, latents).prev_sample
                     
+                    # for name, module in self.unet.named_modules():
+                    #     if name=="down_blocks":                           
+                    #         transformer_block = module[0].attentions[0].transformer_blocks[0]
+                    #         keyframes = len(latents)//camera_batch_size
+                    #         batch_size, sequence_len, dim = transformer_block.kf_attn_output.shape
+                    #         attn_map = transformer_block.kf_attn_output.view(batch_size // keyframes, keyframes, sequence_len, dim)[0]
+                    #         hidden_w = hidden_h = int(math.sqrt(sequence_len))
+                    #         assert hidden_w * hidden_h == sequence_len
+                    #         attn_data = attn_map.detach().to(torch.float32)
+                    #         with torch.amp.autocast('cuda', enabled=False):
+                    #             low_rank_data, _, _ = torch.pca_lowrank(attn_data, 1, center=True)
+                    #         low_rank_data = low_rank_data.view(keyframes, hidden_h, hidden_w, 1)
+                    #         for index, attn_image in enumerate(low_rank_data):
+                    #             attn_image = torch.clamp(attn_image / (attn_image.std() * 2) / 2 + 0.5, 0, 1).cpu().numpy()
+                    #             attn_image = (attn_image * 255.0).astype(np.uint8)
+                    #             attn_image = np.concatenate([np.zeros_like(attn_image), attn_image, np.zeros_like(attn_image)],axis=-1)
+                    #             cv2.imwrite(f"debug/attn_{t}_{pivotal_idx[index]}.jpg", attn_image)
+                            
+                    
         print("Editing finished.")
         return latents
 
@@ -310,6 +345,7 @@ class DGEGuidance(BaseObject):
         text_embeddings: Float[Tensor, "BB 77 768"],
         latents: Float[Tensor, "B 4 DH DW"],
         image_cond_latents: Float[Tensor, "B 4 DH DW"],
+        depth_latents: Float[Tensor, "B 1 DW DW"],
         t: Int[Tensor, "B"],
         cams= None,
     ):
@@ -327,6 +363,9 @@ class DGEGuidance(BaseObject):
             noise_pred_uncond = []
             pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0,len(latents),camera_batch_size) 
             print(pivotal_idx)
+            register_low_vram(self.unet, self.cfg.low_vram)
+            register_extra_fusing(self.unet, self.cfg.extra_fusing_ratio)
+            register_depth_align_strength(self.unet, self.cfg.depth_align_strength)
             register_pivotal(self.unet, True)
 
             latent_model_input = torch.cat([latents[pivotal_idx]] * 3)
@@ -344,17 +383,29 @@ class DGEGuidance(BaseObject):
                 register_cams(self.unet, cams[b:b + camera_batch_size], pivotal_idx[i] % camera_batch_size, key_cams) 
                 
                 epipolar_constrains = {}
+                epipolar_depth_error = {}
                 for down_sample_factor in [1, 2, 4, 8]:
                     H = current_H // down_sample_factor
                     W = current_W // down_sample_factor
                     epipolar_constrains[H * W] = []
-                    for cam in cams[b:b + camera_batch_size]:
+                    epipolar_depth_error[H * W] = []
+                    for cam_index, cam in enumerate(cams[b:b + camera_batch_size], b):
                         cam_epipolar_constrains = []
-                        for key_cam in key_cams:
+                        cam_epipolar_depth_error = []
+                        for pivot_array_index, key_cam in enumerate(key_cams):
                             cam_epipolar_constrains.append(compute_epipolar_constrains(key_cam, cam, current_H=H, current_W=W))
+                            cam_epipolar_depth_error.append(
+                                compute_epipolar_depth_error(key_cam, cam, 
+                                    depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
+                                    depth2=depth_latents[cam_index].unsqueeze(0),
+                                    current_H=H, current_W=W
+                                )
+                            )
                         epipolar_constrains[H * W].append(torch.stack(cam_epipolar_constrains, dim=0))
+                        epipolar_depth_error[H * W].append(torch.stack(cam_epipolar_depth_error, dim=0))
                     epipolar_constrains[H * W] = torch.stack(epipolar_constrains[H * W], dim=0)
-                register_epipolar_constrains(self.unet, epipolar_constrains)
+                    epipolar_depth_error[H * W] = torch.stack(epipolar_depth_error[H * W], dim=0)
+                register_epipolar_geometry(self.unet, epipolar_constrains, epipolar_depth_error)
 
                 batch_model_input = torch.cat([latents[b:b + camera_batch_size]] * 3)
                 batch_text_embeddings = torch.cat([positive_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size]], dim=0)
@@ -388,6 +439,7 @@ class DGEGuidance(BaseObject):
         self,
         rgb: Float[Tensor, "B H W C"],
         cond_rgb: Float[Tensor, "B H W C"],
+        depth_map: Float[Tensor, "B H W C"],
         prompt_utils: PromptProcessorOutput,
         gaussians = None,
         cams= None,
@@ -425,6 +477,14 @@ class DGEGuidance(BaseObject):
         del cond_rgb_BCHW
         del cond_rgb_BCHW_HW8
         
+        depth_map_BCHW = depth_map.permute(0, 3, 1, 2).cuda()
+        depth_map_BCHW_HW8 = F.interpolate(
+            depth_map_BCHW, latents.shape[-2:], mode="bilinear", align_corners=False
+        )
+        depth_latents = depth_map_BCHW_HW8.to(torch.float16)
+        del depth_map_BCHW
+        del depth_map_BCHW_HW8
+        
         if self.cfg.low_vram:
             torch.cuda.empty_cache()
 
@@ -444,7 +504,7 @@ class DGEGuidance(BaseObject):
         ).repeat(batch_size)
 
         if self.cfg.use_sds:
-            grad = self.compute_grad_sds(text_embeddings, latents, cond_latents, t)
+            grad = self.compute_grad_sds(text_embeddings, latents, cond_latents, depth_latents, t)
             grad = torch.nan_to_num(grad)
             if self.grad_clip_val is not None:
                 grad = grad.clamp(-self.grad_clip_val, self.grad_clip_val)
@@ -457,7 +517,7 @@ class DGEGuidance(BaseObject):
                 "max_step": self.max_step,
             }
         else:
-            edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, t, cams)
+            edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, depth_latents, t, cams)
             edit_images = self.decode_latents(edit_latents)
             edit_images = F.interpolate(edit_images, (H, W), mode="bilinear")
 
