@@ -10,15 +10,13 @@ import torch
 import yaml
 import math
 
-from gaussiansplatting.utils.graphics_utils import fov2focal, get_fundamental_matrix_with_H
+from gaussiansplatting.utils.graphics_utils import fov2focal, depth_to_3d
 import torchvision.transforms as T
 from torchvision.io import read_video,write_video
 import os
 import random
 import numpy as np
 from torchvision.io import write_video
-from kornia.geometry.depth import depth_to_3d
-from kornia.geometry.transform import remap
 
 def isinstance_str(x: object, cls_name: str):
     """
@@ -152,34 +150,9 @@ def save_video(raw_frames, save_path, fps=10):
 
     frames = (raw_frames * 255).to(torch.uint8).cpu().permute(0, 2, 3, 1)
     write_video(save_path, frames, fps=fps, video_codec=video_codec, options=video_options)
-
-
-def compute_epipolar_constrains(cam1, cam2, current_H=64, current_W=64):
-    n_frames = 1
-    sequence_length = current_W * current_H
-    fundamental_matrix_1 = []
     
-    fundamental_matrix_1.append(get_fundamental_matrix_with_H(cam1, cam2, current_H, current_W))
-    fundamental_matrix_1 = torch.stack(fundamental_matrix_1, dim=0)
 
-    x = torch.arange(current_W)
-    y = torch.arange(current_H)
-    x, y = torch.meshgrid(x, y, indexing='xy')
-    x = x.reshape(-1)
-    y = y.reshape(-1)
-    heto_cam2 = torch.stack([x, y, torch.ones(size=(len(x),))], dim=1).view(-1, 3).cuda()
-    heto_cam1 = torch.stack([x, y, torch.ones(size=(len(x),))], dim=1).view(-1, 3).cuda()
-    # epipolar_line: n_frames X seq_len,  3
-    line1 = (heto_cam2.unsqueeze(0).repeat(n_frames, 1, 1) @ fundamental_matrix_1.cuda()).view(-1, 3)
-    
-    distance1 = point_to_line_dist(heto_cam1, line1)
-
-    
-    idx1_epipolar = distance1 > 1 # sequence_length x sequence_lengths
-
-    return idx1_epipolar
-
-def compute_epipolar_depth_error(cam1, cam2, depth1, depth2, current_H=64, current_W=64):
+def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, current_W=64):
     """compute depth map error of cam2 with respect to cam1
 
     Args:
@@ -191,45 +164,80 @@ def compute_epipolar_depth_error(cam1, cam2, depth1, depth2, current_H=64, curre
         current_W (int, optional): _description_. Defaults to 64.
     """
     batch_size, _, DH, DW = depth1.shape
-    depth1 = F.interpolate(depth1, (current_H, current_W), mode="bilinear", align_corners=False)
-    depth2 = F.interpolate(depth2, (current_H, current_W), mode="bilinear", align_corners=False)
+    dtype = depth1.dtype
+    device = depth1.device
+    # depth1 = F.interpolate(depth1, (current_H, current_W), mode="bilinear", align_corners=False)
+    # depth2 = F.interpolate(depth2, (current_H, current_W), mode="bilinear", align_corners=False)
     
-    cam_1_view2world = torch.inverse(cam1.world_view_transform)[:, :].T.unsqueeze(0).float()
-    # cam_2_view2world = torch.inverse(cam2.world_view_transform)[:, [0,1,2]].T.unsqueeze(0).float()
+    # cam_1_view2world = torch.inverse(cam1.world_view_transform)[:, :].T.unsqueeze(0).float()
+    cam_2_view2world = torch.inverse(cam2.world_view_transform)[:, :].T.unsqueeze(0).float()
     
     K1 = torch.tensor(
-        [[[fov2focal(cam1.FoVx, current_W), 0, current_W / 2], [0, fov2focal(cam1.FoVy, current_H), current_H / 2], [0, 0, 1]]],
+        [[[fov2focal(cam1.FoVx, DW), 0, DW / 2], [0, fov2focal(cam1.FoVy, DH), DH / 2], [0, 0, 1]]],
         dtype=depth1.dtype,
         device=depth1.device
     )
     K2 = torch.tensor(
-        [[[fov2focal(cam2.FoVx, current_W), 0, current_W / 2], [0, fov2focal(cam2.FoVy, current_H), current_H / 2], [0, 0, 1]]],
+        [[[fov2focal(cam2.FoVx, DW), 0, DW / 2], [0, fov2focal(cam2.FoVy, DH), DH / 2], [0, 0, 1]]],
         dtype=depth2.dtype,
         device=depth2.device
     )
     
-    cam_2_pixel = K2 @ cam2.world_view_transform[:, [0,1,2]].T
+    cam_1_pixel = K1 @ cam1.world_view_transform[:, [0,1,2]].T
     
     homogeneous_filler = torch.ones_like(depth1) # shape B 1 H W
-    points1 = torch.cat([depth_to_3d(depth1, K1), homogeneous_filler], dim=1) # shape B 4 H W
-    # points2 = torch.cat([depth_to_3d(depth2, K2), homogeneous_filler], dim=1)
-    points1 = torch.bmm(cam_1_view2world, points1.view(batch_size, 4, current_H * current_W)).view(batch_size, 4, current_H, current_W)
-    # points2 = torch.bmm(cam_2_view2world, points2.view(batch_size, 4, current_H * current_W)).view(batch_size, 3, current_H, current_W)
-    points1_on_2 = torch.bmm(cam_2_pixel, points1.view(batch_size, 4, current_H * current_W)).view(batch_size, 3, current_H, current_W)
-    points1_on_2 = points1_on_2[:, :2, :, :] / points1_on_2[:, [2], :, :] # B 2 H W, disposing homogeneous item
+    # points1 = torch.cat([depth_to_3d(depth1, K1), homogeneous_filler], dim=1) # shape B 4 H W
+    points2 = torch.cat([depth_to_3d(depth2, K2), homogeneous_filler], dim=1)
+    # points1 = torch.bmm(cam_1_view2world, points1.view(batch_size, 4, DH * DW)).view(batch_size, 4, DH, DW)
+    points2 = torch.bmm(cam_2_view2world, points2.view(batch_size, 4, DH * DW)).view(batch_size, 4, DH, DW)
+    points2_on_1 = torch.bmm(cam_1_pixel, points2.view(batch_size, 4, DH * DW)).view(batch_size, 3, DH, DW)
+    points2_on_1 = (points2_on_1[:, :2, :, :] / points2_on_1[:, [2], :, :]).view(2, DH, DW) # 2 H W, disposing homogeneous item
     
-    x = torch.arange(current_W)
-    y = torch.arange(current_H)
-    x, y = torch.meshgrid(x, y, indexing='xy')
-    map2_coordinates = torch.stack([x, y], dim=0).unsqueeze(0).cuda()
+    valid_mask = torch.logical_and(
+        torch.logical_and(points2_on_1[0] >= 0, points2_on_1[0] < DW),
+        torch.logical_and(points2_on_1[1] >= 0, points2_on_1[1] < DH)
+    )[None, :, :]
     
-    norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).repeat(batch_size, 1, current_H, current_W).cuda()
-    points1_on_2 = torch.clamp(points1_on_2 / norm_factor, min=-1, max=2).view(batch_size, 2, 1, -1)
-    map2_coordinates = (map2_coordinates / norm_factor).view(batch_size, 2, -1, 1)
+    points2_binned = torch.round(points2_on_1.permute(1, 2, 0) - 0.5).view(DH * DW, 2).long() # H*W 2 (x, y)
+    bin_mask = torch.logical_and(
+        torch.logical_and(points2_on_1[0] >= 0, points2_on_1[0] < DW),
+        torch.logical_and(points2_on_1[1] >= 0, points2_on_1[1] < DH)
+    ).view(-1)
+    points2_binned = points2_binned[bin_mask]
+    points2_binned = points2_binned[:, 1] * DW + points2_binned[:, 0] # H*W
     
-    dist2d = points1_on_2 - map2_coordinates
-    dist = torch.norm(dist2d, dim=1).view(current_H * current_W, current_H * current_W)
-    return dist
+    depth2_flat = depth2.view(DH * DW)
+    
+    valid_depth = torch.zeros_like(depth2_flat)
+    valid_depth.scatter_reduce_(0, points2_binned, depth2_flat[bin_mask.view(-1)], "amin", include_self=False)
+    max_depth = valid_depth.max()
+    
+    valid_depth_mask = (depth2_flat < max_depth).view(1, DH, DW)
+    
+    # mask on map 2 to indicate valid pixels
+    valid_mask = torch.logical_and(valid_mask, valid_depth_mask).view(DH * DW)
+    
+    x,y = torch.meshgrid([torch.arange(DW), torch.arange(DH)], indexing="xy")
+    points2_on_2 = 0.5 + torch.stack([x, y], dim=2).view(DH, DW, 2).to(dtype).cuda()
+    
+    points2_on_1_scaled = points2_on_1 * torch.tensor([current_W / DW, current_H / DH]).view(2, 1, 1).to(dtype).cuda() # C H W
+    points2_on_2_scaled = points2_on_2 * torch.tensor([current_W / DW, current_H / DH]).view(1, 1, 2).to(dtype).cuda() # H W C
+    points2_on_2_scaled_pixel = torch.round(points2_on_2_scaled - 0.5).long() # [0, W-1] [0, H-1] range
+    points2_on_2_scaled_pixel = points2_on_2_scaled_pixel[:, :, 1] * current_W + points2_on_2_scaled_pixel[:, :, 0] # flat coordinates
+    
+    points2_on_1_collected = torch.ones([2, current_H * current_W], dtype=dtype, device=device) * -1
+    points2_on_1_collected.scatter_reduce_(1, 
+        points2_on_2_scaled_pixel.view(1, DH * DW).repeat(2, 1)[:, valid_mask], 
+        points2_on_1_scaled.view(2, DH * DW)[:, valid_mask], "mean", include_self=False)
+    
+    points2_on_1_collected = points2_on_1_collected.view(2, current_H, current_W)
+    valid_mask = (points2_on_1_collected[0] != -1).view(1, current_H, current_W)
+    
+    norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).cuda()
+    points2_on_1_norm = (points2_on_1_collected / norm_factor).view(2, current_W, current_H) # C H W output, [0, 1] range
+    points2_on_1_norm = 2 * (points2_on_1_norm - 0.5) # [-1, 1] range
+    
+    return points2_on_1_norm, valid_mask # C H W output
 
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -237,12 +245,12 @@ def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
 
-def register_epipolar_geometry(diffusion_model, epipolar_constrains, epipolar_depth_error):
+def register_depth_correspondence(diffusion_model, depth_correspondence, depth_valid_mask):
     for _, module in diffusion_model.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "BasicTransformerBlock"):
-            setattr(module, "epipolar_constrains", epipolar_constrains)
-            setattr(module, "epipolar_depth_error", epipolar_depth_error)
+            setattr(module, "depth_correspondence", depth_correspondence)
+            setattr(module, "depth_valid_mask", depth_valid_mask)
 
 def register_cams(diffusion_model, cams, pivot_this_batch, key_cams):
     for _, module in diffusion_model.named_modules():
@@ -345,6 +353,7 @@ def register_extended_attention(model):
             to_out = self.to_out
         def extended_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map=None):
             assert encoder_hidden_states is None 
+            assert attention_mask is None
             batch_size, sequence_length, dim = x.shape
             h = self.heads
             n_frames = batch_size // 3
@@ -441,6 +450,9 @@ def register_extended_attention(model):
             query = self.head_to_batch_dim(q)
             key = self.head_to_batch_dim(k)
             value = self.head_to_batch_dim(v)
+            
+            if attention_mask is not None:
+                attention_mask = attention_mask.repeat(self.heads, 1, 1)
 
             # attention_probs = self.get_attention_scores(query, key)
             # hidden_states = torch.bmm(attention_probs, value)
@@ -465,6 +477,7 @@ def register_extended_attention(model):
             setattr(module.attn1,"orig_forward", module.attn1.forward)
             module.attn1.forward = sa_forward(module.attn1)
 
+
 def compute_camera_distance(cams, key_cams):
     cam_centers = [cam.camera_center for cam in cams]
     key_cam_centers = [cam.camera_center for cam in key_cams] 
@@ -474,9 +487,9 @@ def compute_camera_distance(cams, key_cams):
 
     return cam_distance   
 
-def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
-    class DGEBlock(block_class):
+    class Flatten3DBlock(block_class):
         def forward(
             self,
             hidden_states,
@@ -511,96 +524,23 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                     batch_idxs = [self.batch_idx]
                     if self.batch_idx > 0:
                         batch_idxs.append(self.batch_idx - 1)
-                    idx1 = []
-                    idx2 = []
                     cam_distance = compute_camera_distance(self.cams, self.key_cams)
                     cam_distance_min = cam_distance.sort(dim=-1)
                     closest_cam = cam_distance_min[1][:,:len(batch_idxs)]
-                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[1][closest_cam]
-                    sim = torch.einsum('bld,bcsd->bcls', norm_hidden_states[1] / norm_hidden_states[1].norm(dim=-1, keepdim=True), closest_cam_pivot_hidden_states / closest_cam_pivot_hidden_states.norm(dim=-1, keepdim=True)).squeeze()
-                        
-                    if len(batch_idxs) == 2:
-                        sim1, sim2 = sim.chunk(2, dim=1)
-                        sim1 = sim1.view(-1, sequence_length)
-                        sim2 = sim2.view(-1, sequence_length)
-                        sim1_max = sim1.max(dim=-1)
-                        sim2_max = sim2.max(dim=-1)
-                        idx1.append(sim1_max[1])
-                        idx2.append(sim2_max[1])
-
-                    else:
-                        sim = sim.view(-1, sequence_length)
-                        sim_max = sim.max(dim=-1)
-                        idx1.append(sim_max[1])
-
-                    if len(batch_idxs) == 2:
-                        idx1 = []
-                        idx2 = []
-                        pivot_this_batch = self.pivot_this_batch
-                        
-                        idx1_epipolar, idx2_epipolar = self.epipolar_constrains[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, self.epipolar_constrains[sequence_length].shape[2], self.epipolar_constrains[sequence_length].shape[3])).cuda().chunk(2, dim=1)
-                        depth1_error_epipolar, depth2_error_epipolar = self.epipolar_depth_error[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, *self.epipolar_depth_error[sequence_length].shape[2:])).cuda().chunk(2, dim=1)
-                        idx1_epipolar = idx1_epipolar.reshape(n_frames, sequence_length, sequence_length)
-    
-                        idx1_epipolar[pivot_this_batch, ...] = False
-                        idx2_epipolar = idx2_epipolar.reshape(n_frames, sequence_length, sequence_length)
-
-                        idx1_epipolar = idx1_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        idx2_epipolar = idx2_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        idx2_sum = idx2_epipolar.sum(dim=-1)
-                        idx1_sum = idx1_epipolar.sum(dim=-1)
-
-                        idx1_epipolar[idx1_sum == sequence_length, :] = False
-                        idx2_epipolar[idx2_sum == sequence_length, :] = False
-                        
-                        depth1_error_epipolar = depth1_error_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        depth2_error_epipolar = depth2_error_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        sim1 -= self.depth_align_strength * depth1_error_epipolar
-                        sim2 -= self.depth_align_strength * depth2_error_epipolar
-                        
-                        sim1[idx1_epipolar] = -10 * self.depth_align_strength
-                        sim2[idx2_epipolar] = -10 * self.depth_align_strength
-
-                        sim1_max = sim1.max(dim=-1)
-                        sim2_max = sim2.max(dim=-1)
-                        idx1.append(sim1_max[1])
-                        idx2.append(sim2_max[1])
-
-                        
-                    else:
-                        idx1 = []
-                        pivot_this_batch = self.pivot_this_batch
-
-                        idx1_epipolar = self.epipolar_constrains[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, self.epipolar_constrains[sequence_length].shape[2], self.epipolar_constrains[sequence_length].shape[3])).cuda()
-                        depth1_error_epipolar = self.epipolar_depth_error[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, *self.epipolar_depth_error[sequence_length].shape[2:])).cuda()
-
-                        idx1_epipolar = idx1_epipolar.view(n_frames, -1, sequence_length)
-                        idx1_epipolar[pivot_this_batch, ...] = False
-
-                        idx1_epipolar = idx1_epipolar.view(n_frames * sequence_length, sequence_length)
-                        idx1_sum = idx1_epipolar.sum(dim=-1)
-                        idx1_epipolar[idx1_sum == sequence_length, :] = False
-                        
-                        depth1_error_epipolar = depth1_error_epipolar.view(n_frames * sequence_length, sequence_length)
-                        sim -= self.depth_align_strength * depth1_error_epipolar
-                        
-                        sim[idx1_epipolar] = -10 * self.depth_align_strength # DIST_MAX < 10
-                        
-                        sim_max = sim.max(dim=-1)
-                        idx1.append(sim_max[1])
-                            
-                    idx1 = torch.stack(idx1 * 3, dim=0) # 3, n_frames * seq_len
-                    idx1 = idx1.squeeze(1)
-
-
-                    if len(batch_idxs) == 2:
-                        idx2 = torch.stack(idx2 * 3, dim=0) # 3, n_frames * seq_len
-                        idx2 = idx2.squeeze(1)
-
-                            
+                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[:, closest_cam].view(3, n_frames, len(batch_idxs) * sequence_length, dim)
+                    
+                    key_frame_count = len(self.key_cams)
+                    key_cam_selector = torch.arange(key_frame_count).view(1, -1).repeat(n_frames, 1).cuda()
+                    # shape (frames, len(keycams), 2, DH, DW)
+                    depth_correspondence = self.depth_correspondence[sequence_length].gather(dim=1, index=key_cam_selector[:, :, None, None, None].expand(-1, -1, *self.depth_correspondence[sequence_length].shape[2:]))
+                    depth_valid_mask = self.depth_valid_mask[sequence_length].gather(dim=1, index=key_cam_selector[:, :, None, None, None].expand(-1, -1, *self.depth_valid_mask[sequence_length].shape[2:]))
             
             # 1. Self-Attention
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+            if type(self.attn1.to_out) is torch.nn.modules.container.ModuleList:
+                to_out = self.attn1.to_out[0]
+            else:
+                to_out = self.attn1.to_out
             if self.use_normal_attn:
                 # print("use normal attn")
                 attn_output = self.attn1(
@@ -617,98 +557,75 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             norm_hidden_states.view(batch_size, sequence_length, dim),
                             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                             use_normal_attn=self.use_normal_attn,
+                            skip_map={"out": True},
                             **cross_attention_kwargs,
                         )
                     # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
                     self.kf_attn_output = attn_output
+                    attn_output = to_out(attn_output)
 
                 else:
-                    batch_kf_size, _, _ = self.kf_attn_output.shape
-                    attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
-                                    closest_cam]
-                    pivot_kv = self.pivot_hidden_states[:, closest_cam]
-
-            # gather values from attn_output, using idx as indices, and get a tensor of shape 3, n_frames, seq_len, dim
-            if not self.use_normal_attn:
-                if not self.pivotal_pass:
-                    if len(batch_idxs) == 2:
-                        attn_1, attn_2 = attn_output[:, :, 0], attn_output[:, :, 1]
-                        idx1 = idx1.view(3, n_frames, sequence_length)
-                        idx2 = idx2.view(3, n_frames, sequence_length)
-                        attn_output1 = attn_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        attn_output2 = attn_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        d1 = cam_distance_min[0][:,0]
-                        d2 = cam_distance_min[0][:,1]
-                        # w1 = d2 / (d1 + d2)
-                        # w1 = torch.sigmoid(w1)
-                        w1 = torch.nn.functional.softmax(torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)]),dim=0)[0]
-                        w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
-                        attn_output1 = attn_output1.view(3, n_frames, sequence_length, dim)
-                        attn_output2 = attn_output2.view(3, n_frames, sequence_length, dim)
-                        attn_output = w1 * attn_output1 + (1 - w1) * attn_output2
-                        attn_output = attn_output.reshape(
-                            batch_size, sequence_length, dim).half()
-                    else:
-                        idx1 = idx1.view(3, n_frames, sequence_length)
-                        attn_output = attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        attn_output = attn_output.reshape(batch_size, sequence_length, dim).half() 
-                        
-                           
-                    if self.extra_fusing_ratio > 0: 
-                        if len(batch_idxs) == 2:
-                            kv_1, kv_2 = pivot_kv[:, :, 0], pivot_kv[:, :, 1]
-                            idx1 = idx1.view(3, n_frames, sequence_length)
-                            idx2 = idx2.view(3, n_frames, sequence_length)
-                            pivot_kv_1 = kv_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                            pivot_kv_2 = kv_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
-                            d1 = cam_distance_min[0][:,0]
-                            d2 = cam_distance_min[0][:,1]
-                            w1 = torch.stack([d2 / (d1 + d2), d1 / (d1 + d2)])
-                            # w1 = torch.sigmoid(w1)
-                            w1 = torch.nn.functional.softmax(w1, dim=0)[0]
-                            w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
-                            pivot_kv_1 = pivot_kv_1.view(3, n_frames, sequence_length, dim)
-                            pivot_kv_2 = pivot_kv_2.view(3, n_frames, sequence_length, dim)
-                            pivot_kv = w1 * pivot_kv_1 + (1 - w1) * pivot_kv_2
-                            pivot_kv = pivot_kv.half()
-                        else:
-                            idx1 = idx1.view(3, n_frames, sequence_length)
-                            pivot_kv = pivot_kv[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
-                            pivot_kv = pivot_kv.half()
-                            
-                        # cross attention towards key frames
-                        if self.low_vram:
-                            extra_fusing_output = []
-                            for i in range(norm_hidden_states.shape[1]):
-                                extra_fusing_output.append(
-                                    self.attn1(
-                                        norm_hidden_states[:, i],
-                                        torch.cat([norm_hidden_states[:,i], pivot_kv[:, i]], dim=-2), # TODO maybe concat with original KV for better performance?
-                                        use_normal_attn=True,
-                                        **cross_attention_kwargs
-                                    )
-                                )
-                            extra_fusing_output = torch.stack(extra_fusing_output, dim=1).reshape(batch_size, sequence_length, dim).half()  
-                        else:
-                            extra_fusing_output = self.attn1(
-                                norm_hidden_states.view(batch_size, sequence_length, dim),
-                                torch.cat([norm_hidden_states, pivot_kv], dim=-2).view(batch_size, -1, dim), # TODO maybe concat with original KV for better performance?
+                    _, _, _, DH, DW = depth_correspondence.shape
+                    depth_grid = depth_correspondence.permute(0, 1, 3, 4, 2) # frames, keycams, DH, DW, 2
+                    # kf attn output, not passed to_out
+                    kf_attn_outputs = self.kf_attn_output.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
+                    
+                    sampled_attn_outputs = F.grid_sample(
+                        kf_attn_outputs.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
+                        depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
+                        mode="bilinear",
+                        padding_mode="border",
+                        align_corners=False
+                    ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
+                    
+                    depth_valid_mask[self.pivot_this_batch][self.batch_idx] = False
+                    attn_mask = depth_valid_mask.view(n_frames, key_frame_count, DH * DW).permute(0, 2, 1).repeat(3, 1, 1).view((3 * n_frames * sequence_length, 1, key_frame_count))
+                    
+                    # do FLATTEN attention (IS shape correct?)
+                    # sampled_attn_outputs = sampled_attn_outputs.permute(0, 2, 1, 3).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
+                    # attn_mask = attn_mask.permute(0, 2, 1).reshape(3 * n_frames * sequence_length, 1, key_frame_count) # mask on keys
+                    
+                    filter_flatten = attn_mask.squeeze().sum(dim=-1) > 0
+                    
+                    # if self.low_vram:
+                    attn_output = []
+                    for i in range(norm_hidden_states.shape[1]):
+                        attn_output.append(
+                            self.attn1(
+                                norm_hidden_states[:, i],
+                                encoder_hidden_states=torch.cat([norm_hidden_states[:, i], closest_cam_pivot_hidden_states[:, i]], dim=1),
                                 use_normal_attn=True,
+                                skip_map={"out": True},
                                 **cross_attention_kwargs
-                            ).half() 
-                            # closest_attn_outputs = self.kf_attn_output.view(
-                            #         3, batch_kf_size // 3, sequence_length, dim
-                            #     )[:, closest_cam].view(3, n_frames, -1, dim)
-                            # extra_fusing_output = self.attn1(
-                            #     extra_fusing_output.view(batch_size * sequence_length, 1, dim),
-                            #     closest_attn_outputs.view(batch_size * sequence_length, -1, dim), # TODO maybe concat with original KV for better performance?
-                            #     use_normal_attn=True,
-                            #     skip_linear=True,
-                            #     **cross_attention_kwargs
-                            # ).half() 
-                            # extra_fusing_output = extra_fusing_output.view(batch_size, sequence_length, dim)
-                        
-                        attn_output = self.extra_fusing_ratio * extra_fusing_output + (1 - self.extra_fusing_ratio) * attn_output
+                            )
+                        )
+                    attn_output = torch.stack(attn_output, dim=1).reshape(batch_size * sequence_length, 1, dim).half()  
+                    # else:
+                    #     # first do normal self attention
+                    #     attn_output = self.attn1(
+                    #         norm_hidden_states.view(batch_size, sequence_length, dim),
+                    #         encoder_hidden_states=torch.cat([norm_hidden_states, closest_cam_pivot_hidden_states], dim=2).view(batch_size, -1, dim),
+                    #         use_normal_attn=True,
+                    #         skip_map={"out": True},
+                    #         **cross_attention_kwargs
+                    #     ).view(batch_size * sequence_length, 1, dim).half()
+                    
+                    attn_output[filter_flatten] = self.attn1(
+                        attn_output[filter_flatten], # equivalent to batch_size * sequence_length, 1, dim
+                        encoder_hidden_states=sampled_attn_outputs[filter_flatten],
+                        attention_mask=attn_mask[filter_flatten],
+                        use_normal_attn=True,
+                        skip_map={
+                            "q": True,
+                            "k": True,
+                            "v": True,
+                            "out": True
+                        },
+                        **cross_attention_kwargs,
+                    )
+                    
+                    attn_output = to_out(attn_output).view(batch_size, sequence_length, dim).half()
+
                         
             if self.use_ada_layer_norm_zero:
                 self.n = gate_msa.unsqueeze(1) * attn_output               
@@ -752,5 +669,5 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             if hasattr(self, "kf_attn_output"):
                 del self.kf_attn_output
 
-    return DGEBlock
+    return Flatten3DBlock
 
