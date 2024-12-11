@@ -557,12 +557,10 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                             norm_hidden_states.view(batch_size, sequence_length, dim),
                             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                             use_normal_attn=self.use_normal_attn,
-                            skip_map={"out": True},
                             **cross_attention_kwargs,
                         )
                     # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
                     self.kf_attn_output = attn_output
-                    attn_output = to_out(attn_output)
 
                 else:
                     _, _, _, DH, DW = depth_correspondence.shape
@@ -588,18 +586,17 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                     filter_flatten = attn_mask.squeeze().sum(dim=-1) > 0
                     
                     # if self.low_vram:
-                    attn_output = []
-                    for i in range(norm_hidden_states.shape[1]):
-                        attn_output.append(
-                            self.attn1(
-                                norm_hidden_states[:, i],
-                                encoder_hidden_states=torch.cat([norm_hidden_states[:, i], closest_cam_pivot_hidden_states[:, i]], dim=1),
-                                use_normal_attn=True,
-                                skip_map={"out": True},
-                                **cross_attention_kwargs
-                            )
-                        )
-                    attn_output = torch.stack(attn_output, dim=1).reshape(batch_size * sequence_length, 1, dim).half()  
+                    # attn_output = []
+                    # for i in range(norm_hidden_states.shape[1]):
+                    #     attn_output.append(
+                    #         self.attn1(
+                    #             norm_hidden_states[:, i],
+                    #             encoder_hidden_states=torch.cat([norm_hidden_states[:, i], closest_cam_pivot_hidden_states[:, i]], dim=1),
+                    #             use_normal_attn=True,
+                    #             **cross_attention_kwargs
+                    #         )
+                    #     )
+                    # attn_output = torch.stack(attn_output, dim=1).reshape(batch_size * sequence_length, 1, dim).half()  
                     # else:
                     #     # first do normal self attention
                     #     attn_output = self.attn1(
@@ -610,13 +607,14 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                     #         **cross_attention_kwargs
                     #     ).view(batch_size * sequence_length, 1, dim).half()
                     
+                    attn_output = torch.zeros_like(norm_hidden_states).view(batch_size * sequence_length, 1, dim).half()
+                    
                     attn_output[filter_flatten] = self.attn1(
-                        attn_output[filter_flatten], # equivalent to batch_size * sequence_length, 1, dim
+                        norm_hidden_states.view(batch_size * sequence_length, 1, dim)[filter_flatten], # equivalent to batch_size * sequence_length, 1, dim
                         encoder_hidden_states=sampled_attn_outputs[filter_flatten],
                         attention_mask=attn_mask[filter_flatten],
                         use_normal_attn=True,
                         skip_map={
-                            "q": True,
                             "k": True,
                             "v": True,
                             "out": True
@@ -624,7 +622,8 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                         **cross_attention_kwargs,
                     )
                     
-                    attn_output = to_out(attn_output).view(batch_size, sequence_length, dim).half()
+                    attn_output[~filter_flatten] = to_out(attn_output[~filter_flatten]).half()
+                    attn_output = attn_output.view(batch_size, sequence_length, dim)
 
                         
             if self.use_ada_layer_norm_zero:
