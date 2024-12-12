@@ -566,64 +566,53 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                     _, _, _, DH, DW = depth_correspondence.shape
                     depth_grid = depth_correspondence.permute(0, 1, 3, 4, 2) # frames, keycams, DH, DW, 2
                     # kf attn output, not passed to_out
-                    kf_attn_outputs = self.kf_attn_output.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
+                    pivot_hidden_states = self.pivot_hidden_states.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
                     
-                    sampled_attn_outputs = F.grid_sample(
-                        kf_attn_outputs.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
+                    sampled_pivot_hidden_state = F.grid_sample(
+                        pivot_hidden_states.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
                         depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
                         mode="bilinear",
                         padding_mode="border",
                         align_corners=False
-                    ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
+                    ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 1, 3, 2).reshape(3, n_frames, key_frame_count * sequence_length, dim)
                     
-                    depth_valid_mask[self.pivot_this_batch][self.batch_idx] = False
-                    attn_mask = depth_valid_mask.view(n_frames, key_frame_count, DH * DW).permute(0, 2, 1).repeat(3, 1, 1).view((3 * n_frames * sequence_length, 1, key_frame_count))
+                    attn_mask = depth_valid_mask.view(1, n_frames, 1, key_frame_count, sequence_length)
+                    filter_flatten = attn_mask.squeeze().sum(dim=-2, keepdim=True) > 0
+                    attn_mask = torch.cat([~filter_flatten[None, :, None, :, :], attn_mask], dim=-2).repeat(3, 1, 1, 1, 1)
+                    attn_mask = attn_mask.view(3, n_frames, 1, (key_frame_count + 1) * sequence_length)
                     
                     # do FLATTEN attention (IS shape correct?)
                     # sampled_attn_outputs = sampled_attn_outputs.permute(0, 2, 1, 3).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
-                    # attn_mask = attn_mask.permute(0, 2, 1).reshape(3 * n_frames * sequence_length, 1, key_frame_count) # mask on keys
+                    # attn_mask = attn_mask.permute(0, 2, 1).reshape(3 * n_frames * sequence_length, 1, key_frame_count) # mask on keys                
                     
-                    filter_flatten = attn_mask.squeeze().sum(dim=-1) > 0
-                    
-                    # if self.low_vram:
-                    # attn_output = []
-                    # for i in range(norm_hidden_states.shape[1]):
-                    #     attn_output.append(
-                    #         self.attn1(
-                    #             norm_hidden_states[:, i],
-                    #             encoder_hidden_states=torch.cat([norm_hidden_states[:, i], closest_cam_pivot_hidden_states[:, i]], dim=1),
-                    #             use_normal_attn=True,
-                    #             **cross_attention_kwargs
-                    #         )
-                    #     )
-                    # attn_output = torch.stack(attn_output, dim=1).reshape(batch_size * sequence_length, 1, dim).half()  
-                    # else:
-                    #     # first do normal self attention
-                    #     attn_output = self.attn1(
-                    #         norm_hidden_states.view(batch_size, sequence_length, dim),
-                    #         encoder_hidden_states=torch.cat([norm_hidden_states, closest_cam_pivot_hidden_states], dim=2).view(batch_size, -1, dim),
-                    #         use_normal_attn=True,
-                    #         skip_map={"out": True},
-                    #         **cross_attention_kwargs
-                    #     ).view(batch_size * sequence_length, 1, dim).half()
-                    
-                    attn_output = torch.zeros_like(norm_hidden_states).view(batch_size * sequence_length, 1, dim).half()
-                    
-                    attn_output[filter_flatten] = self.attn1(
-                        norm_hidden_states.view(batch_size * sequence_length, 1, dim)[filter_flatten], # equivalent to batch_size * sequence_length, 1, dim
-                        encoder_hidden_states=sampled_attn_outputs[filter_flatten],
-                        attention_mask=attn_mask[filter_flatten],
-                        use_normal_attn=True,
-                        skip_map={
-                            "k": True,
-                            "v": True,
-                            "out": True
-                        },
-                        **cross_attention_kwargs,
-                    )
-                    
-                    attn_output[~filter_flatten] = to_out(attn_output[~filter_flatten]).half()
-                    attn_output = attn_output.view(batch_size, sequence_length, dim)
+                    # cross attention towards key frames
+                    if self.low_vram:
+                        attn_output = []
+                        for i in range(norm_hidden_states.shape[1]):
+                            attn_output.append(
+                                self.attn1(
+                                    norm_hidden_states[:, i],
+                                    torch.cat([
+                                        norm_hidden_states[:, i], 
+                                        sampled_pivot_hidden_state[:, i]
+                                        ], dim=-2), # TODO maybe concat with original KV for better performance?
+                                    attention_mask=attn_mask[:, i],
+                                    use_normal_attn=True,
+                                    **cross_attention_kwargs
+                                )
+                            )
+                        attn_output = torch.stack(attn_output, dim=1).reshape(batch_size, sequence_length, dim).half()  
+                    else:
+                        attn_output = self.attn1(
+                            norm_hidden_states.view(batch_size, sequence_length, dim),
+                            torch.cat([
+                                norm_hidden_states.view(batch_size, sequence_length, dim), 
+                                sampled_pivot_hidden_state.view(batch_size, key_frame_count * sequence_length, dim)
+                                ], dim=1).view(batch_size, -1, dim), # TODO maybe concat with original KV for better performance?
+                            attention_mask=attn_mask.view(batch_size, 1, -1),
+                            use_normal_attn=True,
+                            **cross_attention_kwargs
+                        ).half() 
 
                         
             if self.use_ada_layer_norm_zero:
