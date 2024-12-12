@@ -16,7 +16,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.flatten3d_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, make_flatten3d_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
+from threestudio.utils.flatten3d_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, register_corre_attn_strength, make_flatten3d_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
 
 @threestudio.register("flatten3d-guidance")
 class Flatten3DGuidance(BaseObject):
@@ -43,8 +43,7 @@ class Flatten3DGuidance(BaseObject):
         max_step_percent: float = 0.98
         diffusion_steps: int = 20
         use_sds: bool = False
-        extra_fusing_ratio: float = 0.0
-        depth_align_strength: float = 0.1
+        corre_attn_strength: float = 0.8
         camera_batch_size: int = 5
 
     cfg: Config
@@ -64,10 +63,10 @@ class Flatten3DGuidance(BaseObject):
             "cache_dir": self.cfg.cache_dir,
         }
 
-        self.pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+        self.pipe:StableDiffusionInstructPix2PixPipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             self.cfg.ip2p_name_or_path, **pipe_kwargs
         ).to(self.device)
-        self.scheduler = DDIMScheduler.from_pretrained(
+        self.scheduler:DDIMScheduler = DDIMScheduler.from_pretrained(
             self.cfg.ddim_scheduler_name_or_path,
             subfolder="scheduler",
             torch_dtype=self.weights_dtype,
@@ -237,6 +236,7 @@ class Flatten3DGuidance(BaseObject):
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
             for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
                 register_low_vram(self.unet, self.cfg.low_vram)
+                register_corre_attn_strength(self.unet, self.cfg.corre_attn_strength)
                 if t < 100:
                     unregister_pivotal_data(self.unet)
                     self.use_normal_unet()
@@ -361,6 +361,7 @@ class Flatten3DGuidance(BaseObject):
             pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0,len(latents),camera_batch_size) 
             print(pivotal_idx)
             register_low_vram(self.unet, self.cfg.low_vram)
+            register_corre_attn_strength(self.unet, self.cfg.corre_attn_strength)
             register_pivotal(self.unet, True)
 
             latent_model_input = torch.cat([latents[pivotal_idx]] * 3)

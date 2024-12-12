@@ -286,16 +286,11 @@ def register_t(diffusion_model, t):
     # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "t", t)
-
-def register_extra_fusing(diffusion_model, fusing_ratio):
-    for _, module in diffusion_model.named_modules():
-        if isinstance_str(module, "BasicTransformerBlock"):
-            module.extra_fusing_ratio = fusing_ratio
             
-def register_depth_align_strength(diffusion_model, strength):
+def register_corre_attn_strength(diffusion_model, corre_attn_strength):
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
-            module.depth_align_strength = strength
+            module.corre_attn_strength = corre_attn_strength
             
 def register_low_vram(diffusion_model, low_vram):
     for _, module in diffusion_model.named_modules():
@@ -351,7 +346,7 @@ def register_extended_attention(model):
             to_out = self.to_out[0]
         else:
             to_out = self.to_out
-        def extended_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map=None):
+        def extended_forward(x, encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
             assert encoder_hidden_states is None 
             assert attention_mask is None
             batch_size, sequence_length, dim = x.shape
@@ -360,7 +355,7 @@ def register_extended_attention(model):
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
 
-            skip_map = {} if skip_map is None else skip_map
+            skip_map = cross_attention_kwargs.get("skip_map", {})
             
             skippable_to_q = nn.Identity() if skip_map.get("q", False) else self.to_q
             skippable_to_k = nn.Identity() if skip_map.get("k", False) else self.to_k
@@ -428,21 +423,27 @@ def register_extended_attention(model):
             
             return out
         
-        def skippable_normal_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map=None):
+        def skippable_normal_forward(x, encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
             # assert encoder_hidden_states is None 
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
             
-            skip_map = {} if skip_map is None else skip_map
+            skip_map = cross_attention_kwargs.get("skip_map", {})
+            key_override = cross_attention_kwargs.get("key_override", None)
             
             skippable_to_q = nn.Identity() if skip_map.get("q", False) else self.to_q
             skippable_to_k = nn.Identity() if skip_map.get("k", False) else self.to_k
             skippable_to_v = nn.Identity() if skip_map.get("v", False) else self.to_v
             skippable_to_out = nn.Identity() if skip_map.get("out", False) else to_out
             
-            q = skippable_to_q(x)
-            k = skippable_to_k(encoder_hidden_states)
-            v = skippable_to_v(encoder_hidden_states)
+            if key_override is not None:
+                q = skippable_to_q(x)
+                k = skippable_to_k(key_override)
+                v = skippable_to_v(encoder_hidden_states)
+            else:
+                q = skippable_to_q(x)
+                k = skippable_to_k(encoder_hidden_states)
+                v = skippable_to_v(encoder_hidden_states)
 
             if self.group_norm is not None:
                 hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -452,7 +453,7 @@ def register_extended_attention(model):
             value = self.head_to_batch_dim(v)
             
             if attention_mask is not None:
-                attention_mask = attention_mask.repeat(self.heads, 1, 1)
+                attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
             # attention_probs = self.get_attention_scores(query, key)
             # hidden_states = torch.bmm(attention_probs, value)
@@ -463,12 +464,13 @@ def register_extended_attention(model):
                 
             return out
         
-        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False, skip_map={}):
+        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False, **cross_attention_kwargs):
+            skip_map = cross_attention_kwargs.get("skip_map", {})
             if use_normal_attn:
                 if len(skip_map) == 0: return self.orig_forward(x, encoder_hidden_states, attention_mask)
-                else: return skippable_normal_forward(x, encoder_hidden_states, attention_mask, skip_map)
+                else: return skippable_normal_forward(x, encoder_hidden_states, attention_mask, **cross_attention_kwargs)
             else:
-                return extended_forward(x, encoder_hidden_states, attention_mask, skip_map)
+                return extended_forward(x, encoder_hidden_states, attention_mask, **cross_attention_kwargs)
 
         return forward
 
@@ -581,6 +583,18 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                     attn_mask = torch.cat([~filter_flatten[None, :, None, :, :], attn_mask], dim=-2).repeat(3, 1, 1, 1, 1)
                     attn_mask = attn_mask.view(3, n_frames, 1, (key_frame_count + 1) * sequence_length)
                     
+                    kf_attn_output = self.kf_attn_output.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
+                    sampled_kf_attn_output = F.grid_sample(
+                        kf_attn_output.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
+                        depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
+                        mode="bilinear",
+                        padding_mode="border",
+                        align_corners=False
+                    ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
+                    flatten_attn_mask = depth_valid_mask.view(1, n_frames, 1, key_frame_count, sequence_length).permute(0, 1, 4, 2, 3).repeat(3, 1, 1, 1, 1)
+                    flatten_attn_mask = flatten_attn_mask.view(batch_size * sequence_length, 1, key_frame_count)
+                    flatten_attn_filter = flatten_attn_mask.view(batch_size * sequence_length, key_frame_count).sum(dim=-1) > 0
+                    
                     # do FLATTEN attention (IS shape correct?)
                     # sampled_attn_outputs = sampled_attn_outputs.permute(0, 2, 1, 3).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
                     # attn_mask = attn_mask.permute(0, 2, 1).reshape(3 * n_frames * sequence_length, 1, key_frame_count) # mask on keys                
@@ -612,7 +626,26 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                             attention_mask=attn_mask.view(batch_size, 1, -1),
                             use_normal_attn=True,
                             **cross_attention_kwargs
-                        ).half() 
+                        ).view(batch_size * sequence_length, 1, dim).half() 
+                        
+                    
+                    if sequence_length == np.max(list(self.depth_correspondence.keys())) and self.corre_attn_strength > 0:
+                        corre_attn_output = self.attn1(
+                            norm_hidden_states.view(batch_size * sequence_length, 1, dim)[flatten_attn_filter],
+                            encoder_hidden_states=sampled_kf_attn_output.view(batch_size * sequence_length, key_frame_count, dim)[flatten_attn_filter],
+                            attention_mask=flatten_attn_mask.view(batch_size * sequence_length, 1, key_frame_count)[flatten_attn_filter],
+                            key_override=sampled_pivot_hidden_state.
+                                view(batch_size, key_frame_count, sequence_length, dim).
+                                permute(0, 2, 1, 3).
+                                reshape(batch_size * sequence_length, key_frame_count, dim)[flatten_attn_filter],
+                            skip_map={"q":True, "k":True, "v":True, "out":True},
+                            use_normal_attn=True,
+                            **cross_attention_kwargs
+                        )
+                        
+                        attn_output[flatten_attn_filter] = corre_attn_output * self.corre_attn_strength + attn_output[flatten_attn_filter] * (1-self.corre_attn_strength)
+                    
+                    attn_output = attn_output.view(batch_size, sequence_length, dim).half() 
 
                         
             if self.use_ada_layer_norm_zero:
