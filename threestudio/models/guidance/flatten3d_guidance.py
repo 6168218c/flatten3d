@@ -234,6 +234,23 @@ class Flatten3DGuidance(BaseObject):
             # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
             positive_text_embedding, negative_text_embedding, _ = text_embeddings.chunk(3)
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
+                    
+            depth_correspondence_cache = {}
+            depth_valid_mask_cache = {}
+            for down_sample_factor in [1, 2, 4, 8]:
+                H = current_H // down_sample_factor
+                W = current_W // down_sample_factor
+                depth_correspondence_cache[H * W] = []
+                depth_valid_mask_cache[H * W] = []
+                for _ in cams:
+                    cam_depth_correspondence = []
+                    cam_depth_valid_mask = []
+                    for _ in cams:
+                        cam_depth_correspondence.append(None)
+                        cam_depth_valid_mask.append(None)
+                    depth_correspondence_cache[H * W].append(cam_depth_correspondence)
+                    depth_valid_mask_cache[H * W].append(cam_depth_valid_mask)
+            
             for t in tqdm(self.scheduler.timesteps, "Editing timestep"):
                 register_low_vram(self.unet, self.cfg.low_vram)
                 register_corre_attn_strength(self.unet, self.cfg.corre_attn_strength)
@@ -274,11 +291,16 @@ class Flatten3DGuidance(BaseObject):
                                 cam_depth_correspondence = []
                                 cam_depth_valid_mask = []
                                 for pivot_array_index, key_cam in enumerate(key_cams):
-                                    correspondence, mask = compute_depth_correspondence(key_cam, cam, 
-                                            depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
-                                            depth2=depth_latents[cam_index].unsqueeze(0),
-                                            current_H=H, current_W=W
-                                        )
+                                    if depth_correspondence_cache[H * W][cam_index][pivotal_idx[pivot_array_index]] is None:
+                                        correspondence, mask = compute_depth_correspondence(key_cam, cam, 
+                                                depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
+                                                depth2=depth_latents[cam_index].unsqueeze(0),
+                                                current_H=H, current_W=W
+                                            )
+                                        depth_correspondence_cache[H * W][cam_index][pivotal_idx[pivot_array_index]] = correspondence
+                                        depth_valid_mask_cache[H * W][cam_index][pivotal_idx[pivot_array_index]] = mask
+                                    correspondence = depth_correspondence_cache[H * W][cam_index][pivotal_idx[pivot_array_index]]
+                                    mask = depth_valid_mask_cache[H * W][cam_index][pivotal_idx[pivot_array_index]]
                                     cam_depth_correspondence.append(correspondence)
                                     cam_depth_valid_mask.append(mask)
                                 depth_correspondence[H * W].append(torch.stack(cam_depth_correspondence, dim=0))

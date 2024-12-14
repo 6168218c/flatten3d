@@ -164,33 +164,34 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
         current_W (int, optional): _description_. Defaults to 64.
     """
     batch_size, _, DH, DW = depth1.shape
+    intermediate_dtype = torch.float32
     dtype = depth1.dtype
     device = depth1.device
     # depth1 = F.interpolate(depth1, (current_H, current_W), mode="bilinear", align_corners=False)
     # depth2 = F.interpolate(depth2, (current_H, current_W), mode="bilinear", align_corners=False)
     
-    # cam_1_view2world = torch.inverse(cam1.world_view_transform)[:, :].T.unsqueeze(0).float()
-    cam_2_view2world = torch.inverse(cam2.world_view_transform)[:, :].T.unsqueeze(0).float()
+    # cam_1_view2world = torch.inverse(cam1.world_view_transform)[:, :].T.unsqueeze(0).to(intermediate_dtype)
+    cam_2_view2world = torch.inverse(cam2.world_view_transform)[:, :].T.unsqueeze(0).to(intermediate_dtype)
     
     K1 = torch.tensor(
         [[[fov2focal(cam1.FoVx, DW), 0, DW / 2], [0, fov2focal(cam1.FoVy, DH), DH / 2], [0, 0, 1]]],
-        dtype=depth1.dtype,
+        dtype=intermediate_dtype,
         device=depth1.device
     )
     K2 = torch.tensor(
         [[[fov2focal(cam2.FoVx, DW), 0, DW / 2], [0, fov2focal(cam2.FoVy, DH), DH / 2], [0, 0, 1]]],
-        dtype=depth2.dtype,
+        dtype=intermediate_dtype,
         device=depth2.device
     )
     
     cam_1_pixel = K1 @ cam1.world_view_transform[:, [0,1,2]].T
     
-    homogeneous_filler = torch.ones_like(depth1) # shape B 1 H W
+    homogeneous_filler = torch.ones_like(depth1.to(intermediate_dtype)) # shape B 1 H W
     # points1 = torch.cat([depth_to_3d(depth1, K1), homogeneous_filler], dim=1) # shape B 4 H W
-    points2 = torch.cat([depth_to_3d(depth2, K2), homogeneous_filler], dim=1)
+    points2 = torch.cat([depth_to_3d(depth2.to(intermediate_dtype), K2), homogeneous_filler], dim=1)
     # points1 = torch.bmm(cam_1_view2world, points1.view(batch_size, 4, DH * DW)).view(batch_size, 4, DH, DW)
-    points2 = torch.bmm(cam_2_view2world, points2.view(batch_size, 4, DH * DW)).view(batch_size, 4, DH, DW)
-    points2_on_1 = torch.bmm(cam_1_pixel, points2.view(batch_size, 4, DH * DW)).view(batch_size, 3, DH, DW)
+    points2 = torch.bmm(cam_2_view2world, points2.view(batch_size, 4, DH * DW)).view(batch_size, 4, DH, DW).to(intermediate_dtype)
+    points2_on_1 = torch.bmm(cam_1_pixel, points2.view(batch_size, 4, DH * DW)).view(batch_size, 3, DH, DW).to(intermediate_dtype)
     points2_on_1 = (points2_on_1[:, :2, :, :] / points2_on_1[:, [2], :, :]).view(2, DH, DW) # 2 H W, disposing homogeneous item
     
     valid_mask = torch.logical_and(
@@ -218,14 +219,17 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
     valid_mask = torch.logical_and(valid_mask, valid_depth_mask).view(DH * DW)
     
     x,y = torch.meshgrid([torch.arange(DW), torch.arange(DH)], indexing="xy")
-    points2_on_2 = 0.5 + torch.stack([x, y], dim=2).view(DH, DW, 2).to(dtype).cuda()
+    points2_on_2 = 0.5 + torch.stack([x, y], dim=2).view(DH, DW, 2).to(device)
     
-    points2_on_1_scaled = points2_on_1 * torch.tensor([current_W / DW, current_H / DH]).view(2, 1, 1).to(dtype).cuda() # C H W
-    points2_on_2_scaled = points2_on_2 * torch.tensor([current_W / DW, current_H / DH]).view(1, 1, 2).to(dtype).cuda() # H W C
+    points2_on_1_scaled = points2_on_1 * torch.tensor([current_W / DW, current_H / DH]).view(2, 1, 1).to(device) # C H W
+    points2_on_2_scaled = points2_on_2 * torch.tensor([current_W / DW, current_H / DH]).view(1, 1, 2).to(device) # H W C
     points2_on_2_scaled_pixel = torch.round(points2_on_2_scaled - 0.5).long() # [0, W-1] [0, H-1] range
     points2_on_2_scaled_pixel = points2_on_2_scaled_pixel[:, :, 1] * current_W + points2_on_2_scaled_pixel[:, :, 0] # flat coordinates
     
-    points2_on_1_collected = torch.ones([2, current_H * current_W], dtype=dtype, device=device) * -1
+    # caused by float16 and float32 precision
+    assert torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] >= 0) and torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] < current_H * current_W)
+    
+    points2_on_1_collected = torch.ones([2, current_H * current_W], dtype=intermediate_dtype, device=device) * -1
     points2_on_1_collected.scatter_reduce_(1, 
         points2_on_2_scaled_pixel.view(1, DH * DW).repeat(2, 1)[:, valid_mask], 
         points2_on_1_scaled.view(2, DH * DW)[:, valid_mask], "mean", include_self=False)
@@ -233,8 +237,8 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
     points2_on_1_collected = points2_on_1_collected.view(2, current_H, current_W)
     valid_mask = (points2_on_1_collected[0] != -1).view(1, current_H, current_W)
     
-    norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).cuda()
-    points2_on_1_norm = (points2_on_1_collected / norm_factor).view(2, current_W, current_H) # C H W output, [0, 1] range
+    norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).to(device)
+    points2_on_1_norm = (points2_on_1_collected / norm_factor).view(2, current_W, current_H).to(dtype) # C H W output, [0, 1] range
     points2_on_1_norm = 2 * (points2_on_1_norm - 0.5) # [-1, 1] range
     
     return points2_on_1_norm, valid_mask # C H W output

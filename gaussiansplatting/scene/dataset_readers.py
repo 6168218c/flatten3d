@@ -11,10 +11,11 @@
 
 import os
 import sys
+import json
 from PIL import Image
 from typing import NamedTuple
 from gaussiansplatting.scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
-    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
+    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text, rotmat2qvec
 from gaussiansplatting.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
@@ -358,8 +359,72 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def trainedCameraFromJson(jsonCamera):
+    id = jsonCamera["id"]
+    image_name = jsonCamera["img_name"]
+    width = jsonCamera["width"]
+    height = jsonCamera["height"]
+    pos = np.array(jsonCamera["position"])
+    rot = np.array(jsonCamera["rotation"]).reshape(3, 3)
+    fovY = focal2fov(jsonCamera["fy"], height)
+    fovX = focal2fov(jsonCamera["fx"], width)
+    
+    W2C = np.zeros((4, 4))
+    W2C[:3, :3] = rot
+    W2C[:3, 3] = pos
+    W2C[3, 3] = 1.0
+    
+    Rt = np.linalg.inv(W2C)
+    R = Rt[:3, :3].transpose()
+    T = Rt[:3, 3]
+    qvec = rotmat2qvec(Rt[:3, :3])
+    
+    return CameraInfo(uid=id, R=R, T=T, FovY=fovY, FovX=fovX, 
+                      image=None, image_path="", image_name=image_name,
+                      width=width, height=height, qvec=qvec)
+
+def readTrainedSceneInfo(path, images, eval, llffhold=8):
+    camerainfo_file = os.path.join(path, "cameras.json")
+    with open(camerainfo_file, "r") as f:
+        jsonCameras = json.load(f)
+    
+    cam_infos_unsorted = [trainedCameraFromJson(jsonCamera) for jsonCamera in jsonCameras]
+    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "input.ply")
+    bin_path = os.path.join(path, "input.bin")
+    txt_path = os.path.join(path, "input.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Colmap_hw": readColmapSceneInfo_hw,
+    "Trained": readTrainedSceneInfo,
     "Blender" : readNerfSyntheticInfo
 }
