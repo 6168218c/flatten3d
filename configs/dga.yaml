@@ -18,7 +18,7 @@ data:
   elevation_view_num: 2
   azimuth_view_num: 8
 
-system_type: "dge-system"
+system_type: "dga-system"
 system:
   gs_source: ???
   per_editing_step: 100000
@@ -45,7 +45,7 @@ system:
 
   mask_thres: 0.8
 
-  guidance_type: "flatten3d-guidance"
+  guidance_type: "dga-guidance"
   guidance:
     min_step_percent: 0.02
     max_step_percent: 0.98
@@ -56,7 +56,7 @@ system:
   loggers:
     wandb:
       enable: false
-      project: "threestudio_flatten3d"
+      project: "threestudio_dga"
       name: None
 
   loss:

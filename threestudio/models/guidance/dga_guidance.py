@@ -16,10 +16,10 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.flatten3d_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, register_corre_attn_strength, make_flatten3d_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
+from threestudio.utils.dga_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, register_corre_attn_strength, make_flatten3d_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
 
-@threestudio.register("flatten3d-guidance")
-class Flatten3DGuidance(BaseObject):
+@threestudio.register("dga-guidance")
+class DGAGuidance(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
         cache_dir: Optional[str] = None
@@ -43,7 +43,7 @@ class Flatten3DGuidance(BaseObject):
         max_step_percent: float = 0.98
         diffusion_steps: int = 20
         use_sds: bool = False
-        corre_attn_strength: float = 0.8
+        corre_attn_strength: float = 0.2
         camera_batch_size: int = 5
 
     cfg: Config
@@ -336,24 +336,6 @@ class Flatten3DGuidance(BaseObject):
 
                     # get previous sample, continue loop
                     latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-                    
-                    # for name, module in self.unet.named_modules():
-                    #     if name=="down_blocks":                           
-                    #         transformer_block = module[0].attentions[0].transformer_blocks[0]
-                    #         keyframes = len(latents)//camera_batch_size
-                    #         batch_size, sequence_len, dim = transformer_block.kf_attn_output.shape
-                    #         attn_map = transformer_block.kf_attn_output.view(batch_size // keyframes, keyframes, sequence_len, dim)[0]
-                    #         hidden_w = hidden_h = int(math.sqrt(sequence_len))
-                    #         assert hidden_w * hidden_h == sequence_len
-                    #         attn_data = attn_map.detach().to(torch.float32)
-                    #         with torch.amp.autocast('cuda', enabled=False):
-                    #             low_rank_data, _, _ = torch.pca_lowrank(attn_data, 1, center=True)
-                    #         low_rank_data = low_rank_data.view(keyframes, hidden_h, hidden_w, 1)
-                    #         for index, attn_image in enumerate(low_rank_data):
-                    #             attn_image = torch.clamp(attn_image / (attn_image.std() * 2) / 2 + 0.5, 0, 1).cpu().numpy()
-                    #             attn_image = (attn_image * 255.0).astype(np.uint8)
-                    #             attn_image = np.concatenate([np.zeros_like(attn_image), attn_image, np.zeros_like(attn_image)],axis=-1)
-                    #             cv2.imwrite(f"debug/attn_{t}_{pivotal_idx[index]}.jpg", attn_image)
                             
                     
         print("Editing finished.")

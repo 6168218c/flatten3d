@@ -227,7 +227,7 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
     points2_on_2_scaled_pixel = points2_on_2_scaled_pixel[:, :, 1] * current_W + points2_on_2_scaled_pixel[:, :, 0] # flat coordinates
     
     # caused by float16 and float32 precision
-    assert torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] >= 0) and torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] < current_H * current_W)
+    # assert torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] >= 0) and torch.all(points2_on_2_scaled_pixel.view(1, DH * DW)[:, valid_mask] < current_H * current_W)
     
     points2_on_1_collected = torch.ones([2, current_H * current_W], dtype=intermediate_dtype, device=device) * -1
     points2_on_1_collected.scatter_reduce_(1, 

@@ -52,8 +52,7 @@ system:
     guidance_scale: 7.5
     condition_scale: 1.5
     camera_batch_size: 5
-    extra_fusing_ratio: 0.5
-    depth_align_strength: 0.2
+    extra_fusing_ratio: 0.0
 
   loggers:
     wandb:

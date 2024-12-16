@@ -1,7 +1,5 @@
 from typing import Type
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import os
 
 from pathlib import Path
@@ -10,14 +8,13 @@ import torch
 import yaml
 import math
 
-from gaussiansplatting.utils.graphics_utils import fov2focal, get_fundamental_matrix_with_H
+from gaussiansplatting.utils.graphics_utils import get_fundamental_matrix_with_H
 import torchvision.transforms as T
 from torchvision.io import read_video,write_video
 import os
 import random
 import numpy as np
 from torchvision.io import write_video
-from kornia.geometry.depth import depth_to_3d
 from kornia.geometry.transform import remap
 
 def isinstance_str(x: object, cls_name: str):
@@ -179,70 +176,17 @@ def compute_epipolar_constrains(cam1, cam2, current_H=64, current_W=64):
 
     return idx1_epipolar
 
-def compute_epipolar_depth_error(cam1, cam2, depth1, depth2, current_H=64, current_W=64):
-    """compute depth map error of cam2 with respect to cam1
-
-    Args:
-        cam1 (_type_): _description_
-        cam2 (_type_): _description_
-        depth1 (_type_): _description_
-        depth2 (_type_): _description_
-        current_H (int, optional): _description_. Defaults to 64.
-        current_W (int, optional): _description_. Defaults to 64.
-    """
-    batch_size, _, DH, DW = depth1.shape
-    depth1 = F.interpolate(depth1, (current_H, current_W), mode="bilinear", align_corners=False)
-    depth2 = F.interpolate(depth2, (current_H, current_W), mode="bilinear", align_corners=False)
-    
-    cam_1_view2world = torch.inverse(cam1.world_view_transform)[:, :].T.unsqueeze(0).float()
-    # cam_2_view2world = torch.inverse(cam2.world_view_transform)[:, [0,1,2]].T.unsqueeze(0).float()
-    
-    K1 = torch.tensor(
-        [[[fov2focal(cam1.FoVx, current_W), 0, current_W / 2], [0, fov2focal(cam1.FoVy, current_H), current_H / 2], [0, 0, 1]]],
-        dtype=depth1.dtype,
-        device=depth1.device
-    )
-    K2 = torch.tensor(
-        [[[fov2focal(cam2.FoVx, current_W), 0, current_W / 2], [0, fov2focal(cam2.FoVy, current_H), current_H / 2], [0, 0, 1]]],
-        dtype=depth2.dtype,
-        device=depth2.device
-    )
-    
-    cam_2_pixel = K2 @ cam2.world_view_transform[:, [0,1,2]].T
-    
-    homogeneous_filler = torch.ones_like(depth1) # shape B 1 H W
-    points1 = torch.cat([depth_to_3d(depth1, K1), homogeneous_filler], dim=1) # shape B 4 H W
-    # points2 = torch.cat([depth_to_3d(depth2, K2), homogeneous_filler], dim=1)
-    points1 = torch.bmm(cam_1_view2world, points1.view(batch_size, 4, current_H * current_W)).view(batch_size, 4, current_H, current_W)
-    # points2 = torch.bmm(cam_2_view2world, points2.view(batch_size, 4, current_H * current_W)).view(batch_size, 3, current_H, current_W)
-    points1_on_2 = torch.bmm(cam_2_pixel, points1.view(batch_size, 4, current_H * current_W)).view(batch_size, 3, current_H, current_W)
-    points1_on_2 = points1_on_2[:, :2, :, :] / points1_on_2[:, [2], :, :] # B 2 H W, disposing homogeneous item
-    
-    x = torch.arange(current_W)
-    y = torch.arange(current_H)
-    x, y = torch.meshgrid(x, y, indexing='xy')
-    map2_coordinates = torch.stack([x, y], dim=0).unsqueeze(0).cuda()
-    
-    norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).repeat(batch_size, 1, current_H, current_W).cuda()
-    points1_on_2 = torch.clamp(points1_on_2 / norm_factor, min=-1, max=2).view(batch_size, 2, 1, -1)
-    map2_coordinates = (map2_coordinates / norm_factor).view(batch_size, 2, -1, 1)
-    
-    dist2d = points1_on_2 - map2_coordinates
-    dist = torch.norm(dist2d, dim=1).view(current_H * current_W, current_H * current_W)
-    return dist
-
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
-def register_epipolar_geometry(diffusion_model, epipolar_constrains, epipolar_depth_error):
+def register_epipolar_constrains(diffusion_model, epipolar_constrains):
     for _, module in diffusion_model.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "epipolar_constrains", epipolar_constrains)
-            setattr(module, "epipolar_depth_error", epipolar_depth_error)
 
 def register_cams(diffusion_model, cams, pivot_this_batch, key_cams):
     for _, module in diffusion_model.named_modules():
@@ -283,11 +227,6 @@ def register_extra_fusing(diffusion_model, fusing_ratio):
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
             module.extra_fusing_ratio = fusing_ratio
-            
-def register_depth_align_strength(diffusion_model, strength):
-    for _, module in diffusion_model.named_modules():
-        if isinstance_str(module, "BasicTransformerBlock"):
-            module.depth_align_strength = strength
             
 def register_low_vram(diffusion_model, low_vram):
     for _, module in diffusion_model.named_modules():
@@ -343,24 +282,21 @@ def register_extended_attention(model):
             to_out = self.to_out[0]
         else:
             to_out = self.to_out
-        def extended_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map=None):
+        def extended_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map_qkv=False, skip_map_out=False):
             assert encoder_hidden_states is None 
             batch_size, sequence_length, dim = x.shape
             h = self.heads
             n_frames = batch_size // 3
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
-
-            skip_map = {} if skip_map is None else skip_map
-            
-            skippable_to_q = nn.Identity() if skip_map.get("q", False) else self.to_q
-            skippable_to_k = nn.Identity() if skip_map.get("k", False) else self.to_k
-            skippable_to_v = nn.Identity() if skip_map.get("v", False) else self.to_v
-            skippable_to_out = nn.Identity() if skip_map.get("out", False) else to_out
-            
-            q = skippable_to_q(x)
-            k = skippable_to_k(encoder_hidden_states)
-            v = skippable_to_v(encoder_hidden_states)
+            if skip_map_qkv:
+                q = x
+                k = encoder_hidden_states
+                v = encoder_hidden_states
+            else:
+                q = self.to_q(x)
+                k = self.to_k(encoder_hidden_states)
+                v = self.to_v(encoder_hidden_states)
             
             k_text = k[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
             k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
@@ -415,25 +351,25 @@ def register_extended_attention(model):
             out = torch.cat([out_text, out_image, out_uncond], dim=0)
             out = self.batch_to_head_dim(out)
 
-            out = skippable_to_out(out)
+            if not skip_map_out:
+                out = to_out(out)
             
             return out
         
-        def skippable_normal_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map=None):
+        def skippable_normal_forward(x, encoder_hidden_states=None, attention_mask=None, skip_map_qkv=False, skip_map_out=False):
             # assert encoder_hidden_states is None 
+            batch_size, sequence_length, dim = x.shape
+            h = self.heads
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
-            
-            skip_map = {} if skip_map is None else skip_map
-            
-            skippable_to_q = nn.Identity() if skip_map.get("q", False) else self.to_q
-            skippable_to_k = nn.Identity() if skip_map.get("k", False) else self.to_k
-            skippable_to_v = nn.Identity() if skip_map.get("v", False) else self.to_v
-            skippable_to_out = nn.Identity() if skip_map.get("out", False) else to_out
-            
-            q = skippable_to_q(x)
-            k = skippable_to_k(encoder_hidden_states)
-            v = skippable_to_v(encoder_hidden_states)
+            if skip_map_qkv:
+                q = x
+                k = encoder_hidden_states
+                v = encoder_hidden_states
+            else:
+                q = self.to_q(x)
+                k = self.to_k(encoder_hidden_states)
+                v = self.to_v(encoder_hidden_states)
 
             if self.group_norm is not None:
                 hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -444,19 +380,20 @@ def register_extended_attention(model):
 
             # attention_probs = self.get_attention_scores(query, key)
             # hidden_states = torch.bmm(attention_probs, value)
-            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=self.scale)
+            hidden_states = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=self.scale)
             out = self.batch_to_head_dim(hidden_states)
 
-            out = skippable_to_out(out)
-                
+            if not skip_map_out:
+                out = to_out(out)
+            
             return out
         
-        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False, skip_map={}):
+        def forward(x, encoder_hidden_states=None, attention_mask=None, use_normal_attn=False, skip_map_qkv=False, skip_map_out=False):
             if use_normal_attn:
-                if len(skip_map) == 0: return self.orig_forward(x, encoder_hidden_states, attention_mask)
-                else: return skippable_normal_forward(x, encoder_hidden_states, attention_mask, skip_map)
+                if not skip_map_qkv and not skip_map_out: return self.orig_forward(x, encoder_hidden_states, attention_mask)
+                else: return skippable_normal_forward(x, encoder_hidden_states, attention_mask, skip_map_qkv, skip_map_out)
             else:
-                return extended_forward(x, encoder_hidden_states, attention_mask, skip_map)
+                return extended_forward(x, encoder_hidden_states, attention_mask, skip_map_qkv, skip_map_out)
 
         return forward
 
@@ -464,6 +401,7 @@ def register_extended_attention(model):
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module.attn1,"orig_forward", module.attn1.forward)
             module.attn1.forward = sa_forward(module.attn1)
+
 
 def compute_camera_distance(cams, key_cams):
     cam_centers = [cam.camera_center for cam in cams]
@@ -539,7 +477,6 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         pivot_this_batch = self.pivot_this_batch
                         
                         idx1_epipolar, idx2_epipolar = self.epipolar_constrains[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, self.epipolar_constrains[sequence_length].shape[2], self.epipolar_constrains[sequence_length].shape[3])).cuda().chunk(2, dim=1)
-                        depth1_error_epipolar, depth2_error_epipolar = self.epipolar_depth_error[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, *self.epipolar_depth_error[sequence_length].shape[2:])).cuda().chunk(2, dim=1)
                         idx1_epipolar = idx1_epipolar.reshape(n_frames, sequence_length, sequence_length)
     
                         idx1_epipolar[pivot_this_batch, ...] = False
@@ -552,14 +489,8 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
                         idx1_epipolar[idx1_sum == sequence_length, :] = False
                         idx2_epipolar[idx2_sum == sequence_length, :] = False
-                        
-                        depth1_error_epipolar = depth1_error_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        depth2_error_epipolar = depth2_error_epipolar.reshape(n_frames * sequence_length, sequence_length)
-                        sim1 -= self.depth_align_strength * depth1_error_epipolar
-                        sim2 -= self.depth_align_strength * depth2_error_epipolar
-                        
-                        sim1[idx1_epipolar] = -10 * self.depth_align_strength
-                        sim2[idx2_epipolar] = -10 * self.depth_align_strength
+                        sim1[idx1_epipolar] = 0
+                        sim2[idx2_epipolar] = 0
 
                         sim1_max = sim1.max(dim=-1)
                         sim2_max = sim2.max(dim=-1)
@@ -572,7 +503,6 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         pivot_this_batch = self.pivot_this_batch
 
                         idx1_epipolar = self.epipolar_constrains[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, self.epipolar_constrains[sequence_length].shape[2], self.epipolar_constrains[sequence_length].shape[3])).cuda()
-                        depth1_error_epipolar = self.epipolar_depth_error[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, *self.epipolar_depth_error[sequence_length].shape[2:])).cuda()
 
                         idx1_epipolar = idx1_epipolar.view(n_frames, -1, sequence_length)
                         idx1_epipolar[pivot_this_batch, ...] = False
@@ -580,12 +510,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         idx1_epipolar = idx1_epipolar.view(n_frames * sequence_length, sequence_length)
                         idx1_sum = idx1_epipolar.sum(dim=-1)
                         idx1_epipolar[idx1_sum == sequence_length, :] = False
-                        
-                        depth1_error_epipolar = depth1_error_epipolar.view(n_frames * sequence_length, sequence_length)
-                        sim -= self.depth_align_strength * depth1_error_epipolar
-                        
-                        sim[idx1_epipolar] = -10 * self.depth_align_strength # DIST_MAX < 10
-                        
+                        sim[idx1_epipolar] = 0
                         sim_max = sim.max(dim=-1)
                         idx1.append(sim_max[1])
                             
@@ -753,4 +678,3 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 del self.kf_attn_output
 
     return DGEBlock
-
