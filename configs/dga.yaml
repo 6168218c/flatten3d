@@ -1,4 +1,4 @@
-name: "dge"
+name: "dga"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
@@ -52,6 +52,7 @@ system:
     guidance_scale: 7.5
     condition_scale: 1.5
     camera_batch_size: 5
+    corre_attn_strength: 0.6
 
   loggers:
     wandb:

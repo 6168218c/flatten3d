@@ -16,7 +16,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
-from threestudio.utils.dga_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, register_corre_attn_strength, make_flatten3d_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
+from threestudio.utils.dga_utils import unregister_pivotal_data, register_pivotal, register_batch_idx, register_cams, register_depth_correspondence, register_extended_attention, register_normal_attention, register_extended_attention, register_low_vram, register_corre_attn_strength, make_dga_block, isinstance_str, compute_depth_correspondence, register_normal_attn_flag
 
 @threestudio.register("dga-guidance")
 class DGAGuidance(BaseObject):
@@ -43,7 +43,7 @@ class DGAGuidance(BaseObject):
         max_step_percent: float = 0.98
         diffusion_steps: int = 20
         use_sds: bool = False
-        corre_attn_strength: float = 0.2
+        corre_attn_strength: float = 0.6
         camera_batch_size: int = 5
 
     cfg: Config
@@ -119,7 +119,7 @@ class DGAGuidance(BaseObject):
         threestudio.info(f"Loaded InstructPix2Pix!")
         for _, module in self.unet.named_modules():
             if isinstance_str(module, "BasicTransformerBlock"):
-                make_block_fn = make_flatten3d_block 
+                make_block_fn = make_dga_block 
                 module.__class__ = make_block_fn(module.__class__)
                 # Something needed for older versions of diffusers
                 if not hasattr(module, "use_ada_layer_norm_zero"):

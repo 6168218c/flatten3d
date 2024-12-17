@@ -493,9 +493,9 @@ def compute_camera_distance(cams, key_cams):
 
     return cam_distance   
 
-def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+def make_dga_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
-    class Flatten3DBlock(block_class):
+    class DGABlock(block_class):
         def forward(
             self,
             hidden_states,
@@ -577,7 +577,7 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
                     sampled_pivot_hidden_state = F.grid_sample(
                         pivot_hidden_states.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
                         depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
-                        mode="bilinear",
+                        mode="nearest",
                         padding_mode="border",
                         align_corners=False
                     ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 1, 3, 2).reshape(3, n_frames, key_frame_count * sequence_length, dim)
@@ -694,5 +694,5 @@ def make_flatten3d_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mo
             if hasattr(self, "kf_attn_output"):
                 del self.kf_attn_output
 
-    return Flatten3DBlock
+    return DGABlock
 
