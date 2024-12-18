@@ -152,7 +152,7 @@ def save_video(raw_frames, save_path, fps=10):
     write_video(save_path, frames, fps=fps, video_codec=video_codec, options=video_options)
     
 
-def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, current_W=64):
+def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, current_W=64, loosen_factor=0.02):
     """compute depth map error of cam2 with respect to cam1
 
     Args:
@@ -211,9 +211,11 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
     
     valid_depth = torch.zeros_like(depth2_flat)
     valid_depth.scatter_reduce_(0, points2_binned, depth2_flat[bin_mask.view(-1)], "amin", include_self=False)
-    max_depth = valid_depth.max()
+    loosen_depth = valid_depth.max() - valid_depth.min()
     
-    valid_depth_mask = (depth2_flat < max_depth).view(1, DH, DW)
+    valid_depth_mask = torch.zeros(DH * DW, dtype=torch.bool, device=device)
+    valid_depth_mask[bin_mask.view(-1)] = (depth2_flat[bin_mask.view(-1)] <= valid_depth[points2_binned] + loosen_depth * loosen_factor)
+    valid_depth_mask = valid_depth_mask.view(1, DH, DW)
     
     # mask on map 2 to indicate valid pixels
     valid_mask = torch.logical_and(valid_mask, valid_depth_mask).view(DH * DW)

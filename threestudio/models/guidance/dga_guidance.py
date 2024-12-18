@@ -43,7 +43,8 @@ class DGAGuidance(BaseObject):
         max_step_percent: float = 0.98
         diffusion_steps: int = 20
         use_sds: bool = False
-        corre_attn_strength: float = 0.6
+        corre_attn_strength: float = 0.5
+        depth_loosen_factor: float = 0.02
         camera_batch_size: int = 5
 
     cfg: Config
@@ -295,7 +296,7 @@ class DGAGuidance(BaseObject):
                                         correspondence, mask = compute_depth_correspondence(key_cam, cam, 
                                                 depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
                                                 depth2=depth_latents[cam_index].unsqueeze(0),
-                                                current_H=H, current_W=W
+                                                current_H=H, current_W=W, loosen_factor=self.cfg.depth_loosen_factor
                                             )
                                         depth_correspondence_cache[H * W][cam_index][pivotal_idx[pivot_array_index]] = correspondence
                                         depth_valid_mask_cache[H * W][cam_index][pivotal_idx[pivot_array_index]] = mask
@@ -396,7 +397,7 @@ class DGAGuidance(BaseObject):
                             correspondence, mask = compute_depth_correspondence(key_cam, cam, 
                                     depth1=depth_latents[pivotal_idx[pivot_array_index]].unsqueeze(0),
                                     depth2=depth_latents[cam_index].unsqueeze(0),
-                                    current_H=H, current_W=W
+                                    current_H=H, current_W=W, loosen_factor=self.cfg.depth_loosen_factor
                                 )
                             cam_depth_correspondence.append(correspondence)
                             cam_depth_valid_mask.append(mask)
