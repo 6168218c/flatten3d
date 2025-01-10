@@ -621,7 +621,7 @@ def make_dga_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                                     **cross_attention_kwargs
                                 )
                             )
-                        attn_output = torch.stack(attn_output, dim=1).reshape(batch_size, sequence_length, dim).half()  
+                        attn_output = torch.stack(attn_output, dim=1).reshape(batch_size * sequence_length, 1, dim).half()  
                     else:
                         attn_output = self.attn1(
                             norm_hidden_states.view(batch_size, sequence_length, dim),

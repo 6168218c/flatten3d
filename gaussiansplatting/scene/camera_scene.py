@@ -35,13 +35,16 @@ class CamScene:
             else:
                 scene_info = sceneLoadTypeCallbacks["Colmap_hw"](source_path, h, w, None, False)
         elif os.path.exists(os.path.join(source_path, "point_cloud")):
-            scene_info = sceneLoadTypeCallbacks["Trained"](source_path, None, False)
-            h = scene_info.train_cameras[0].height
-            w = scene_info.train_cameras[0].width
-            if w > 1920:
-                scale = w / 1920
-                h /= scale
-                w /= scale
+            if h == -1 or w == -1:
+                scene_info = sceneLoadTypeCallbacks["Trained"](source_path, None, False)
+                h = scene_info.train_cameras[0].height
+                w = scene_info.train_cameras[0].width
+                if w > 1920:
+                    scale = w / 1920
+                    h /= scale
+                    w /= scale
+            else:
+                scene_info = sceneLoadTypeCallbacks["Trained_hw"](source_path, h, w, None, False)
         else:
             assert False, "Could not recognize scene type!"
 

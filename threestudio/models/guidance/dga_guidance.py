@@ -490,8 +490,8 @@ class DGAGuidance(BaseObject):
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
         t = torch.randint(
-            self.max_step - 1,
             self.max_step,
+            self.max_step + 1,
             [1],
             dtype=torch.long,
             device=self.device,
