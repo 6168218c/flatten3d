@@ -240,7 +240,7 @@ def compute_depth_correspondence(cam1, cam2, depth1, depth2, current_H=64, curre
     valid_mask = (points2_on_1_collected[0] != -1).view(1, current_H, current_W)
     
     norm_factor = torch.tensor([current_W, current_H]).view(1, 2, 1, 1).to(device)
-    points2_on_1_norm = (points2_on_1_collected / norm_factor).view(2, current_W, current_H).to(dtype) # C H W output, [0, 1] range
+    points2_on_1_norm = (points2_on_1_collected / norm_factor).view(2, current_H, current_W).to(dtype) # C H W output, [0, 1] range
     points2_on_1_norm = 2 * (points2_on_1_norm - 0.5) # [-1, 1] range
     
     return points2_on_1_norm, valid_mask # C H W output
@@ -483,7 +483,17 @@ def register_extended_attention(model):
     for _, module in model.unet.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module.attn1,"orig_forward", module.attn1.forward)
+            module.need_depth_aligning = False
             module.attn1.forward = sa_forward(module.attn1)
+    for _, module in model.unet.up_blocks[-2].attentions[0].named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.need_depth_aligning = True
+    for _, module in model.unet.up_blocks[-2].attentions[1].named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.need_depth_aligning = True
+    for _, module in model.unet.up_blocks[-1].attentions[1].named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.need_depth_aligning = True
 
 
 def compute_camera_distance(cams, key_cams):
@@ -589,18 +599,6 @@ def make_dga_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                     attn_mask = torch.cat([~filter_flatten[None, :, None, :, :], attn_mask], dim=-2).repeat(3, 1, 1, 1, 1)
                     attn_mask = attn_mask.view(3, n_frames, 1, (key_frame_count + 1) * sequence_length)
                     
-                    kf_attn_output = self.kf_attn_output.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
-                    sampled_kf_attn_output = F.grid_sample(
-                        kf_attn_output.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
-                        depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
-                        mode="bilinear",
-                        padding_mode="border",
-                        align_corners=False
-                    ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
-                    flatten_attn_mask = depth_valid_mask.view(1, n_frames, 1, key_frame_count, sequence_length).permute(0, 1, 4, 2, 3).repeat(3, 1, 1, 1, 1)
-                    flatten_attn_mask = flatten_attn_mask.view(batch_size * sequence_length, 1, key_frame_count)
-                    flatten_attn_filter = flatten_attn_mask.view(batch_size * sequence_length, key_frame_count).sum(dim=-1) > 0
-                    
                     # do FLATTEN attention (IS shape correct?)
                     # sampled_attn_outputs = sampled_attn_outputs.permute(0, 2, 1, 3).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
                     # attn_mask = attn_mask.permute(0, 2, 1).reshape(3 * n_frames * sequence_length, 1, key_frame_count) # mask on keys                
@@ -635,7 +633,19 @@ def make_dga_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         ).view(batch_size * sequence_length, 1, dim).half() 
                         
                     
-                    if sequence_length == np.max(list(self.depth_correspondence.keys())) and self.corre_attn_strength > 0:
+                    if self.need_depth_aligning and self.corre_attn_strength > 0:
+                        kf_attn_output = self.kf_attn_output.view(3, key_frame_count, DH, DW, dim).permute(0, 1, 4, 2, 3)
+                        sampled_kf_attn_output = F.grid_sample(
+                            kf_attn_output.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
+                            depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
+                            mode="bilinear",
+                            padding_mode="border",
+                            align_corners=False
+                        ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
+                        flatten_attn_mask = depth_valid_mask.view(1, n_frames, 1, key_frame_count, sequence_length).permute(0, 1, 4, 2, 3).repeat(3, 1, 1, 1, 1)
+                        flatten_attn_mask = flatten_attn_mask.view(batch_size * sequence_length, 1, key_frame_count)
+                        flatten_attn_filter = flatten_attn_mask.view(batch_size * sequence_length, key_frame_count).sum(dim=-1) > 0
+                        
                         corre_attn_output = self.attn1(
                             norm_hidden_states.view(batch_size * sequence_length, 1, dim)[flatten_attn_filter],
                             encoder_hidden_states=sampled_kf_attn_output.view(batch_size * sequence_length, key_frame_count, dim)[flatten_attn_filter],
