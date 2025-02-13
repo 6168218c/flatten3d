@@ -266,6 +266,31 @@ class DGA(BaseLift3DSystem):
                     cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
                 )[None]
 
+    def render_validation_original_view(self, cache_name):
+        cache_dir = os.path.join(self.cache_dir, cache_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        with torch.no_grad():
+            for id in tqdm(range(self.trainer.datamodule.val_dataset.total_view_num)):
+                cur_path = os.path.join(cache_dir, "{:0>4d}.png".format(id))
+                if not os.path.exists(cur_path) or self.cfg.cache_overwrite:
+                    cur_cam = self.trainer.datamodule.val_dataset.scene.cameras[id]
+                    cur_batch = {
+                        "index": id,
+                        "camera": [cur_cam],
+                        "height": self.trainer.datamodule.val_dataset.h,
+                        "width": self.trainer.datamodule.val_dataset.w,
+                    }
+                    out = self(cur_batch)["comp_rgb"]
+                    out_to_save = (
+                            out[0].cpu().detach().numpy().clip(0.0, 1.0) * 255.0
+                    ).astype(np.uint8)
+                    out_to_save = cv2.cvtColor(out_to_save, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(cur_path, out_to_save)
+                cached_image = cv2.cvtColor(cv2.imread(cur_path), cv2.COLOR_BGR2RGB)
+                self.origin_frames[id] = torch.tensor(
+                    cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
+                )[None]
+
     def on_before_optimizer_step(self, optimizer):
         with torch.no_grad():
             if self.true_global_step < self.cfg.densify_until_iter:
@@ -375,7 +400,7 @@ class DGA(BaseLift3DSystem):
         out = self(batch, testbackground_tensor)
         if only_rgb:
             self.save_image_grid(
-                f"it{self.true_global_step}-test/{batch['index'][0]}.png",
+                f"it{self.true_global_step}-test/{'%04d' % batch['index'][0]}.png",
                 [
                     {
                         "type": "rgb",
@@ -614,6 +639,7 @@ class DGA(BaseLift3DSystem):
     def on_fit_start(self) -> None:
         super().on_fit_start()
         self.render_all_view(cache_name="origin_render")
+        self.render_validation_original_view(cache_name="validation_original_render")
 
         if len(self.cfg.seg_prompt) > 0:
             self.update_mask()

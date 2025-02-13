@@ -59,9 +59,6 @@ class DGE(BaseLift3DSystem):
         cache_overwrite: bool = True
         cache_dir: str = ""
 
-        # offload
-        low_vram: bool = field(default_factory=
-                               lambda: torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 ** 3) < 12)
 
         # anchor
         anchor_weight_init: float = 0.1
@@ -263,7 +260,7 @@ class DGE(BaseLift3DSystem):
                     cv2.imwrite(cur_path, out_to_save)
                 cached_image = cv2.cvtColor(cv2.imread(cur_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
-                    cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
+                    cached_image / 255, device="cuda", dtype=torch.float32
                 )[None]
 
     def on_before_optimizer_step(self, optimizer):
@@ -375,7 +372,7 @@ class DGE(BaseLift3DSystem):
         out = self(batch, testbackground_tensor)
         if only_rgb:
             self.save_image_grid(
-                f"it{self.true_global_step}-test/{batch['index'][0]}.png",
+                f"it{self.true_global_step}-test/{'%04d' % batch['index'][0]}.png",
                 [
                     {
                         "type": "rgb",
@@ -572,10 +569,10 @@ class DGE(BaseLift3DSystem):
                 assert os.path.exists(original_image_path)
                 cached_image = cv2.cvtColor(cv2.imread(original_image_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
-                    cached_image / 255, device="cpu" if self.cfg.low_vram else "cuda", dtype=torch.float32
+                    cached_image / 255, device="cuda", dtype=torch.float32
                 )[None]
                 original_frames.append(self.origin_frames[id])
-            images = torch.cat(images, dim=0).to(device="cpu" if self.cfg.low_vram else "cuda")
+            images = torch.cat(images, dim=0)
             original_frames = torch.cat(original_frames, dim=0)
 
             edited_images = self.guidance(
@@ -614,7 +611,7 @@ class DGE(BaseLift3DSystem):
                 self.cfg.prompt_processor
             )
         if self.cfg.loss.lambda_l1 > 0 or self.cfg.loss.lambda_p > 0 or self.cfg.loss.use_sds:
-            self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance, low_vram=self.cfg.low_vram)
+            self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
             
 
     def training_step(self, batch, batch_idx):

@@ -485,6 +485,9 @@ def register_extended_attention(model):
             setattr(module.attn1,"orig_forward", module.attn1.forward)
             module.need_depth_aligning = False
             module.attn1.forward = sa_forward(module.attn1)
+    for _, module in model.unet.mid_block.named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            module.need_depth_aligning = True
     for _, module in model.unet.up_blocks[-2].attentions[0].named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
             module.need_depth_aligning = True
@@ -638,7 +641,7 @@ def make_dga_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         sampled_kf_attn_output = F.grid_sample(
                             kf_attn_output.repeat(1, n_frames, 1, 1, 1).view(3 * n_frames * key_frame_count, dim, DH, DW),
                             depth_grid.repeat(3, 1, 1, 1, 1).view(3 * n_frames * key_frame_count, DH, DW, 2),
-                            mode="bilinear",
+                            mode="bicubic",
                             padding_mode="border",
                             align_corners=False
                         ).view(3 * n_frames, key_frame_count, dim, DH * DW).permute(0, 3, 1, 2).reshape(3 * n_frames * sequence_length, key_frame_count, dim)
